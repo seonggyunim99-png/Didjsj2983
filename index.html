@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>사진 보관함</title>
+  <meta name="description" content="휴대폰과 PC의 사진·동영상을 갤러리처럼 보관하고, 백업 파일로 내보내고 복원하는 앱">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#101114" media="(prefers-color-scheme: dark)">
+  <meta name="color-scheme" content="light dark">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="사진 보관함">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="icons/icon-192.png" type="image/png" sizes="192x192">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header id="appbar" class="appbar"></header>
+  <main id="main" class="main"></main>
+  <nav id="tabbar" class="tabbar" aria-label="메뉴"></nav>
+  <div id="selbar" class="selbar" role="toolbar" aria-label="선택한 항목"></div>
+
+  <input type="file" id="file-input" accept="image/*,video/*" multiple hidden>
+  <input type="file" id="folder-input" webkitdirectory multiple hidden>
+  <input type="file" id="zip-input" accept=".zip,application/zip,application/x-zip-compressed" multiple hidden>
+
+  <div id="drop-overlay" class="drop-overlay" hidden>
+    <div><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg><p>여기에 놓으면 보관함에 저장돼요</p></div>
+  </div>
+  <div id="progress" class="progress" hidden></div>
+  <div id="viewer-root"></div>
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toast-root"></div>
+  <noscript><p style="padding:24px">이 앱을 사용하려면 자바스크립트를 켜 주세요.</p></noscript>
+</body>
+</html>

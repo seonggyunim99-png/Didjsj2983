@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B95FF"/>
+      <stop offset="1" stop-color="#2A54E0"/>
+    </linearGradient>
+    <clipPath id="photo"><rect x="132" y="150" width="248" height="190" rx="22"/></clipPath>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <g transform="translate(256 256) scale(1.0) translate(-256 -256)">
+    <rect x="108" y="126" width="296" height="262" rx="40" fill="#ffffff"/>
+    <g clip-path="url(#photo)">
+      <rect x="132" y="150" width="248" height="190" fill="#DCE7FF"/>
+      <circle cx="196" cy="206" r="24" fill="#FFC84A"/>
+      <path d="M120 352 L222 250 L282 310 L322 272 L400 352 Z" fill="#3D6EF0"/>
+    </g>
+    <circle cx="372" cy="364" r="66" fill="#16B364" stroke="#ffffff" stroke-width="16"/>
+    <path d="M372 330 L404 364 L384 364 L384 398 L360 398 L360 364 L340 364 Z" fill="#ffffff"/>
+  </g>
+</svg>

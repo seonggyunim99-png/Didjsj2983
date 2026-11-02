@@ -1,0 +1,288 @@
+// 공통 UI: 아이콘, 포맷, 알림(토스트), 대화상자, 진행 표시
+
+const ICONS = {
+  add: 'M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z',
+  close: 'M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z',
+  back: 'M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z',
+  check: 'M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z',
+  heart: 'M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z',
+  heartOutline: 'M16.5 3c-1.74 0-3.41.81-4.5 2.09C10.91 3.81 9.24 3 7.5 3 4.42 3 2 5.42 2 8.5c0 3.78 3.4 6.86 8.55 11.54L12 21.35l1.45-1.32C18.6 15.36 22 12.28 22 8.5 22 5.42 19.58 3 16.5 3zm-4.4 15.55-.1.1-.1-.1C7.14 14.24 4 11.39 4 8.5 4 6.5 5.5 5 7.5 5c1.54 0 3.04.99 3.57 2.36h1.87C13.46 5.99 14.96 5 16.5 5c2 0 3.5 1.5 3.5 3.5 0 2.89-3.14 5.74-7.9 10.05z',
+  share: 'M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92s2.92-1.31 2.92-2.92-1.31-2.92-2.92-2.92z',
+  info: 'M11 7h2v2h-2zm0 4h2v6h-2zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z',
+  trash: 'M16 9v10H8V9h8m-1.5-6h-5l-1 1H5v2h14V4h-3.5l-1-1zM18 7H6v12c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7z',
+  restore: 'M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z',
+  download: 'M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z',
+  upload: 'M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z',
+  more: 'M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z',
+  image: 'M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z',
+  photos: 'M22 16V4c0-1.1-.9-2-2-2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2zm-11-4 2.03 2.71L16 11l4 5H8l3-4zM2 6v14c0 1.1.9 2 2 2h14v-2H4V6H2z',
+  albums: 'M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9h-4v4h-2v-4H9V9h4V5h2v4h4v2z',
+  cloud: 'M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z',
+  play: 'M8 5v14l11-7z',
+  video: 'M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z',
+  folder: 'M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z',
+  chevronLeft: 'M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z',
+  chevronRight: 'M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z',
+  shield: 'M12 1 3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z',
+  removeCircle: 'M7 11v2h10v-2H7zm5-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z',
+  edit: 'M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a.996.996 0 0 0 0-1.41l-2.34-2.34a.996.996 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z',
+  grid: 'M3 3v8h8V3H3zm6 6H5V5h4v4zm-6 4v8h8v-8H3zm6 6H5v-4h4v4zm4-16v8h8V3h-8zm6 6h-4V5h4v4zm-6 4v8h8v-8h-8zm6 6h-4v-4h4v4z',
+  select: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z',
+  phone: 'M17 1.01 7 1c-1.1 0-2 .9-2 2v18c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V3c0-1.1-.9-1.99-2-1.99zM17 19H7V5h10v14zm-1-6h-3V8h-2v5H8l4 4 4-4z',
+  archive: 'M20.54 5.23 19.15 3.55C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.16.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5 6.5 12H10v-2h4v2h3.5L12 17.5zM5.12 5l.81-1h12l.94 1H5.12z',
+};
+
+export function icon(name, cls = '') {
+  return `<svg class="ic${cls ? ` ${cls}` : ''}" viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[name] || ''}"/></svg>`;
+}
+
+export function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+export function el(html) {
+  const t = document.createElement('template');
+  t.innerHTML = html.trim();
+  return t.content.firstElementChild;
+}
+
+/* ---------- 포맷 ---------- */
+
+const WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
+
+export const fmtNum = (n) => Number(n || 0).toLocaleString('ko-KR');
+
+export function fmtBytes(n) {
+  if (!n) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  const v = n / 1024 ** i;
+  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${u[i]}`;
+}
+
+export function fmtDuration(sec) {
+  const s = Math.max(0, Math.round(sec || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${r}` : `${m}:${r}`;
+}
+
+export function dayKey(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
+
+function startOfDay(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+export function fmtDay(ms) {
+  const d = new Date(ms);
+  const now = new Date();
+  const diff = Math.round((startOfDay(d) - startOfDay(now)) / 864e5);
+  if (diff === 0) return '오늘';
+  if (diff === -1) return '어제';
+  const year = d.getFullYear() === now.getFullYear() ? '' : `${d.getFullYear()}년 `;
+  return `${year}${d.getMonth() + 1}월 ${d.getDate()}일 (${WEEKDAYS[d.getDay()]})`;
+}
+
+export function fmtTime(ms) {
+  const d = new Date(ms);
+  const h = d.getHours();
+  return `${h < 12 ? '오전' : '오후'} ${h % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+export function fmtDateTime(ms) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 (${WEEKDAYS[d.getDay()]}) ${fmtTime(ms)}`;
+}
+
+export function fmtCounts({ photos, videos }) {
+  const parts = [];
+  if (photos) parts.push(`사진 ${fmtNum(photos)}장`);
+  if (videos) parts.push(`동영상 ${fmtNum(videos)}개`);
+  return parts.join(' · ') || '비어 있음';
+}
+
+/* ---------- 토스트 ---------- */
+
+let toastTimer = null;
+export function toast(message, { action, onAction, duration = 3200 } = {}) {
+  const root = document.getElementById('toast-root');
+  root.innerHTML = '';
+  clearTimeout(toastTimer);
+  const t = el(`<div class="toast" role="status"><span>${esc(message)}</span>${action ? `<button type="button">${esc(action)}</button>` : ''}</div>`);
+  root.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  const hide = () => {
+    t.classList.remove('show');
+    setTimeout(() => t.remove(), 250);
+  };
+  t.querySelector('button')?.addEventListener('click', () => {
+    hide();
+    onAction?.();
+  });
+  toastTimer = setTimeout(hide, action ? Math.max(duration, 5000) : duration);
+}
+
+/* ---------- 모달 ---------- */
+
+export function isModalOpen() {
+  return !!document.getElementById('modal-root').children.length;
+}
+
+export function openModal({ html, className = '', onClose, dismissible = true }) {
+  const host = className ? ` for-${className.split(' ')[0]}` : '';
+  const backdrop = el(`<div class="modal-backdrop${host}"><div class="modal ${className}" role="dialog" aria-modal="true">${html}</div></div>`);
+  document.getElementById('modal-root').appendChild(backdrop);
+  requestAnimationFrame(() => backdrop.classList.add('show'));
+  let closed = false;
+  const onKey = (e) => {
+    if (e.key === 'Escape' && dismissible && backdrop === document.getElementById('modal-root').lastElementChild) {
+      e.stopImmediatePropagation();
+      close();
+    }
+  };
+  function close(value) {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener('keydown', onKey, true);
+    backdrop.classList.remove('show');
+    setTimeout(() => backdrop.remove(), 220);
+    onClose?.(value);
+  }
+  document.addEventListener('keydown', onKey, true);
+  backdrop.addEventListener('click', (e) => {
+    if (e.target === backdrop && dismissible) close();
+  });
+  return { el: backdrop.firstElementChild, close, setDismissible: (v) => { dismissible = v; } };
+}
+
+export function confirmDialog({ title, message = '', ok = '확인', cancel = '취소', danger = false }) {
+  return new Promise((resolve) => {
+    const m = openModal({
+      className: 'dialog',
+      html: `<h2>${esc(title)}</h2>${message ? `<p>${esc(message)}</p>` : ''}
+        <div class="dialog-actions">
+          <button type="button" class="btn ghost" data-v="0">${esc(cancel)}</button>
+          <button type="button" class="btn ${danger ? 'danger' : 'primary'}" data-v="1">${esc(ok)}</button>
+        </div>`,
+      onClose: (v) => resolve(v === true),
+    });
+    m.el.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-v]');
+      if (b) m.close(b.dataset.v === '1');
+    });
+    m.el.querySelector('[data-v="1"]').focus();
+  });
+}
+
+export function promptDialog({ title, value = '', placeholder = '', ok = '확인' }) {
+  return new Promise((resolve) => {
+    const m = openModal({
+      className: 'dialog',
+      html: `<h2>${esc(title)}</h2>
+        <form>
+          <input class="input" name="v" maxlength="60" autocomplete="off" placeholder="${esc(placeholder)}" value="${esc(value)}">
+          <div class="dialog-actions">
+            <button type="button" class="btn ghost" data-cancel>취소</button>
+            <button type="submit" class="btn primary">${esc(ok)}</button>
+          </div>
+        </form>`,
+      onClose: (v) => resolve(typeof v === 'string' ? v : null),
+    });
+    const input = m.el.querySelector('input');
+    const submit = m.el.querySelector('[type=submit]');
+    const sync = () => { submit.disabled = !input.value.trim(); };
+    sync();
+    input.addEventListener('input', sync);
+    m.el.querySelector('[data-cancel]').addEventListener('click', () => m.close());
+    m.el.querySelector('form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (input.value.trim()) m.close(input.value.trim());
+    });
+    setTimeout(() => {
+      input.focus();
+      input.select();
+    }, 50);
+  });
+}
+
+/**
+ * 아래에서 올라오는 선택 메뉴
+ * @param {{title?:string, items:{label:string, icon?:string, value:any, danger?:boolean, checked?:boolean, hint?:string}[]}} opts
+ */
+export function actionSheet({ title, items }) {
+  return new Promise((resolve) => {
+    const m = openModal({
+      className: 'sheet',
+      html: `${title ? `<div class="sheet-title">${esc(title)}</div>` : ''}
+        <div class="sheet-list">${items.map((it, i) => `
+          <button type="button" class="sheet-item${it.danger ? ' danger' : ''}" data-i="${i}">
+            ${it.icon ? icon(it.icon) : ''}<span class="sheet-label">${esc(it.label)}${it.hint ? `<small>${esc(it.hint)}</small>` : ''}</span>
+            ${it.checked ? icon('check', 'sheet-check') : ''}
+          </button>`).join('')}
+        </div>`,
+      onClose: (v) => resolve(v === undefined ? null : v),
+    });
+    m.el.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-i]');
+      if (b) m.close(items[+b.dataset.i].value);
+    });
+  });
+}
+
+/* ---------- 진행 표시 ---------- */
+
+export const progress = {
+  el: null,
+  show(title, onCancel) {
+    const root = document.getElementById('progress');
+    root.hidden = false;
+    root.innerHTML = `
+      <div class="progress-head">
+        <strong class="progress-title">${esc(title)}</strong>
+        <span class="progress-count"></span>
+        ${onCancel ? '<button type="button" class="text-btn progress-stop">중지</button>' : ''}
+      </div>
+      <div class="bar"><i></i></div>
+      <div class="progress-detail"></div>`;
+    root.querySelector('.progress-stop')?.addEventListener('click', onCancel);
+    requestAnimationFrame(() => root.classList.add('show'));
+    this.el = root;
+  },
+  update(done, total, detail = '', label = null) {
+    if (!this.el) return;
+    const pct = total ? Math.min(100, (done / total) * 100) : 0;
+    this.el.querySelector('.bar i').style.width = `${pct}%`;
+    this.el.querySelector('.progress-count').textContent = label ?? (total ? `${fmtNum(done)} / ${fmtNum(total)}` : '');
+    this.el.querySelector('.progress-detail').textContent = detail;
+  },
+  hide() {
+    if (!this.el) return;
+    const root = this.el;
+    this.el = null;
+    root.classList.remove('show');
+    setTimeout(() => {
+      if (!this.el) {
+        root.hidden = true;
+        root.innerHTML = '';
+      }
+    }, 250);
+  },
+};
+
+/* ---------- 파일 저장 ---------- */
+
+export function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
