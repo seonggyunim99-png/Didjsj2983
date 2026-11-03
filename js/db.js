@@ -97,8 +97,63 @@ export async function deleteMedia(ids) {
   for (const id of ids) {
     media.delete(id);
     blobs.delete(id);
+    blobs.delete(`orig:${id}`);
   }
   return done(tx);
+}
+
+/** 편집한 파일로 바꿉니다. keepOriginal이면 처음 원본을 `orig:id`로 남겨 둡니다. */
+export async function replaceBlob(id, blob, keepOriginal) {
+  const db = await openDB();
+  const tx = db.transaction('blobs', 'readwrite');
+  const s = tx.objectStore('blobs');
+  if (keepOriginal) {
+    const cur = s.get(id);
+    cur.onsuccess = () => {
+      if (cur.result) s.put({ id: `orig:${id}`, blob: cur.result.blob });
+      s.put({ id, blob });
+    };
+  } else {
+    s.put({ id, blob });
+  }
+  return done(tx);
+}
+
+/** 편집 전 원본으로 되돌립니다. */
+export async function restoreOriginal(id) {
+  const db = await openDB();
+  const tx = db.transaction('blobs', 'readwrite');
+  const s = tx.objectStore('blobs');
+  const orig = s.get(`orig:${id}`);
+  orig.onsuccess = () => {
+    if (!orig.result) return;
+    s.put({ id, blob: orig.result.blob });
+    s.delete(`orig:${id}`);
+  };
+  return done(tx);
+}
+
+function deleteDatabase(name) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.deleteDatabase(name);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => resolve();
+  });
+}
+
+/** 모든 사진·앨범·설정을 지웁니다. */
+export async function destroyAll() {
+  if (dbPromise) {
+    try {
+      (await dbPromise).close();
+    } catch {
+      /* 이미 닫힘 */
+    }
+    dbPromise = null;
+  }
+  await deleteDatabase(DB_NAME);
+  await deleteDatabase(INBOX_NAME);
 }
 
 export async function putAlbum(album) {

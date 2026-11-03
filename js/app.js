@@ -2,12 +2,18 @@
 import * as lib from './library.js';
 import { store } from './library.js';
 import { readInbox, clearInbox } from './db.js';
-import { detectType, kindOf, extOf } from './media.js';
+import { detectType, kindOf, extOf, readExifDetails } from './media.js';
 import {
   icon, esc, fmtNum, fmtBytes, fmtDuration, fmtDay, fmtDateTime, fmtCounts, dayKey,
   toast, openModal, confirmDialog, promptDialog, actionSheet, progress, downloadBlob, isModalOpen,
+  dateTimeDialog,
 } from './ui.js';
 import { Viewer } from './viewer.js';
+import { Editor } from './editor.js';
+import * as lock from './lock.js';
+import { createScroller } from './scroller.js';
+
+const APP_VERSION = '2.0';
 
 const $ = (s, root = document) => root.querySelector(s);
 const appbar = $('#appbar');
@@ -27,7 +33,9 @@ const canPickFolder = 'webkitdirectory' in document.createElement('input') && !i
 /* ---------- 설정 ---------- */
 
 const GRID_SIZES = { s: '작게', m: '보통', l: '크게' };
-const prefs = { grid: 'm' };
+const GRID_ORDER = ['s', 'm', 'l'];
+const THEMES = { system: '시스템 설정', light: '밝게', dark: '어둡게' };
+const prefs = { grid: 'm', theme: 'system' };
 try {
   Object.assign(prefs, JSON.parse(localStorage.getItem('pv-prefs') || '{}'));
 } catch {
@@ -42,6 +50,20 @@ function savePrefs() {
 }
 document.documentElement.dataset.grid = GRID_SIZES[prefs.grid] ? prefs.grid : 'm';
 
+const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+function applyTheme() {
+  const theme = THEMES[prefs.theme] ? prefs.theme : 'system';
+  if (theme === 'system') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+  const dark = theme === 'dark' || (theme === 'system' && darkQuery.matches);
+  document.querySelectorAll('meta[name="theme-color"]').forEach((m) => {
+    m.removeAttribute('media');
+    m.content = dark ? '#101114' : '#ffffff';
+  });
+}
+applyTheme();
+darkQuery.addEventListener?.('change', applyTheme);
+
 /* ---------- 상태 ---------- */
 
 let route = parseRoute();
@@ -55,7 +77,13 @@ let uploadAlbumId = null;
 let installEvent = null;
 let navigatedInApp = false;
 let askedPersist = false;
+let editor = null;
+let searchQuery = '';
 const scrollMemory = new Map();
+const scroller = createScroller({
+  topInset: () => Math.max(0, appbar.getBoundingClientRect().bottom),
+  bottomInset: () => (window.innerWidth >= 900 ? 16 : tabbar.offsetHeight + 8),
+});
 
 /* ---------- 뒤로가기(안드로이드 뒤로 버튼) 처리 ---------- */
 
@@ -88,13 +116,16 @@ window.addEventListener('popstate', () => {
 function parseRoute() {
   const [name, id] = location.hash.replace(/^#\/?/, '').split('/');
   if (name === 'album' && id) return { name: 'album', id: decodeURIComponent(id) };
-  if (['photos', 'albums', 'favorites', 'videos', 'trash', 'backup'].includes(name)) return { name };
+  if (['photos', 'albums', 'favorites', 'videos', 'trash', 'backup', 'search', 'settings'].includes(name)) return { name };
   return { name: 'photos' };
 }
 
 const routeKey = (r) => r.name + (r.id ? `/${r.id}` : '');
-const TAB_OF = { photos: 'photos', albums: 'albums', album: 'albums', favorites: 'albums', videos: 'albums', trash: 'albums', backup: 'backup' };
-const isGalleryRoute = () => ['photos', 'favorites', 'videos', 'album', 'trash'].includes(route.name);
+const TAB_OF = {
+  photos: 'photos', search: 'photos', albums: 'albums', album: 'albums', favorites: 'albums', videos: 'albums', trash: 'albums',
+  backup: 'backup', settings: 'backup',
+};
+const isGalleryRoute = () => ['photos', 'favorites', 'videos', 'album', 'trash', 'search'].includes(route.name);
 
 window.addEventListener('hashchange', () => {
   scrollMemory.set(routeKey(route), window.scrollY);
@@ -107,27 +138,34 @@ window.addEventListener('hashchange', () => {
 
 function goBack() {
   if (navigatedInApp) history.back();
-  else location.replace('#/albums');
+  else location.replace(route.name === 'search' ? '#/photos' : route.name === 'settings' ? '#/backup' : '#/albums');
 }
 
 /* ---------- 썸네일 ---------- */
 
 const thumbUrls = new Map();
 
+function cachedThumb(m) {
+  const c = thumbUrls.get(m.id);
+  return c && c.blob === m.thumb ? c.url : null;
+}
+
 function thumbURL(m) {
   if (!m?.thumb) return null;
-  let url = thumbUrls.get(m.id);
-  if (!url) {
-    url = URL.createObjectURL(m.thumb);
-    thumbUrls.set(m.id, url);
-  }
+  const cached = cachedThumb(m);
+  if (cached) return cached;
+  const old = thumbUrls.get(m.id);
+  if (old) URL.revokeObjectURL(old.url);
+  const url = URL.createObjectURL(m.thumb);
+  thumbUrls.set(m.id, { blob: m.thumb, url });
   return url;
 }
 
 function cleanupThumbs() {
-  for (const [id, url] of thumbUrls) {
-    if (!store.byId.has(id)) {
-      URL.revokeObjectURL(url);
+  for (const [id, c] of thumbUrls) {
+    const m = store.byId.get(id);
+    if (!m || m.thumb !== c.blob) {
+      URL.revokeObjectURL(c.url);
       thumbUrls.delete(id);
     }
   }
@@ -168,12 +206,64 @@ function computeList() {
     case 'videos': return lib.activeMedia().filter((m) => m.kind === 'video');
     case 'album': return lib.albumMedia(route.id);
     case 'trash': return lib.trashedMedia();
+    case 'search': return searchMedia(searchQuery);
     default: return [];
   }
 }
 
+/* ---------- 검색 ---------- */
+
+const WEEK = ['일', '월', '화', '수', '목', '금', '토'];
+
+function searchText(m) {
+  const d = new Date(m.takenAt);
+  const albums = m.albums.map((a) => lib.getAlbum(a)?.name || '').join(' ');
+  const shot = /screenshot|스크린샷|screen_?shot|캡처/i.test(m.name);
+  return ` ${m.name} ${albums} ${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 ${WEEK[d.getDay()]}요일 `
+    + `${m.kind === 'video' ? '동영상 비디오 video' : '사진 photo'} ${m.favorite ? '즐겨찾기' : ''} `
+    + `${m.edited || m.editedAt ? '편집 편집한' : ''} ${shot ? '스크린샷 screenshot' : ''} ${m.type} `.toLowerCase();
+}
+
+function searchMedia(q) {
+  const tokens = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return [];
+  const year = new Date().getFullYear();
+  const norm = tokens.map((t) => {
+    if (t === '올해') return ` ${year}년`;
+    if (t === '작년') return ` ${year - 1}년`;
+    if (/^\d{4}$/.test(t)) return ` ${t}년`;
+    if (/^\d+(년|월|일)$/.test(t)) return ` ${t}`;
+    if (t === '편집한' || t === '편집된') return '편집';
+    return t;
+  });
+  return lib.activeMedia().filter((m) => {
+    const text = searchText(m);
+    return norm.every((t) => text.includes(t));
+  });
+}
+
+/* ---------- 추억 ("N년 전 오늘") ---------- */
+
+function memories() {
+  const now = new Date();
+  const groups = new Map();
+  for (const m of lib.activeMedia()) {
+    const d = new Date(m.takenAt);
+    const years = now.getFullYear() - d.getFullYear();
+    if (years < 1) continue;
+    const same = new Date(now.getFullYear(), d.getMonth(), d.getDate());
+    const diff = Math.round((same - new Date(now.getFullYear(), now.getMonth(), now.getDate())) / 864e5);
+    if (Math.abs(diff) > 3) continue;
+    if (!groups.has(years)) groups.set(years, { years, exact: false, items: [] });
+    const g = groups.get(years);
+    g.items.push(m);
+    if (diff === 0) g.exact = true;
+  }
+  return [...groups.values()].sort((a, b) => a.years - b.years);
+}
+
 function tileHTML(m, i, { trash = false, selected } = {}) {
-  const url = thumbUrls.get(m.id);
+  const url = cachedThumb(m);
   const kindLabel = m.kind === 'video' ? '동영상' : '사진';
   let badges = '';
   if (m.kind === 'video') badges += `<span class="badge badge-video">${icon('play')}${m.duration ? fmtDuration(m.duration) : ''}</span>`;
@@ -263,6 +353,20 @@ function renderAppbar() {
       <button type="button" class="text-btn" data-act="sel-all">${all ? '선택 해제' : '전체 선택'}</button>`;
     return;
   }
+  if (route.name === 'search') {
+    if (appbar.querySelector('#search-input')) return; // 입력 중인 검색창은 그대로 둡니다
+    appbar.className = 'appbar is-search';
+    appbar.innerHTML = `
+      ${iconBtn('back', 'back', '뒤로')}
+      <label class="search-field">${icon('search')}
+        <input id="search-input" type="search" enterkeyhint="search" autocomplete="off" placeholder="날짜, 앨범, 파일 이름 검색" value="${esc(searchQuery)}" aria-label="사진 검색">
+      </label>
+      ${searchQuery ? iconBtn('clear-search', 'close', '검색어 지우기') : ''}`;
+    const input = appbar.querySelector('#search-input');
+    input.addEventListener('input', () => onSearchInput(input.value));
+    if (!searchQuery) setTimeout(() => input.focus(), 50);
+    return;
+  }
   const root = ['photos', 'albums', 'backup'].includes(route.name);
   let title = '';
   let sub = '';
@@ -272,7 +376,7 @@ function renderAppbar() {
     case 'photos':
       title = '사진';
       sub = counts();
-      actions = iconBtn('add', 'add', '사진 추가') + iconBtn('menu', 'more', '더보기');
+      actions = iconBtn('search', 'search', '검색') + iconBtn('add', 'add', '사진 추가') + iconBtn('menu', 'more', '더보기');
       break;
     case 'albums':
       title = '앨범';
@@ -301,6 +405,10 @@ function renderAppbar() {
       break;
     case 'backup':
       title = '백업';
+      actions = iconBtn('settings', 'settings', '설정');
+      break;
+    case 'settings':
+      title = '설정';
       break;
     default:
   }
@@ -349,6 +457,9 @@ function renderMain() {
   else if (isGalleryRoute()) renderGallery();
   else if (route.name === 'albums') renderAlbums();
   else if (route.name === 'backup') renderBackup();
+  else if (route.name === 'settings') renderSettings();
+  if (isGalleryRoute() && store.loaded) requestAnimationFrame(() => scroller.refresh(main));
+  else scroller.disable();
 }
 
 function emptyHTML({ ic, title, text, buttons = '' }) {
@@ -361,6 +472,14 @@ function renderGallery() {
     return;
   }
   let html = '';
+  if (route.name === 'search') {
+    if (!searchQuery.trim()) {
+      main.innerHTML = searchSuggestionsHTML();
+      return;
+    }
+    if (list.length) html += `<p class="result-count">검색 결과 ${fmtNum(list.length)}개</p>`;
+  }
+  if (route.name === 'photos' && !sel.active) html += memoriesHTML();
   if (route.name === 'trash') {
     html += `<div class="banner">${icon('info')}<span>휴지통의 항목은 ${lib.TRASH_DAYS}일이 지나면 영구 삭제돼요. 타일의 숫자는 남은 날짜예요.</span></div>`;
   }
@@ -378,6 +497,7 @@ function renderGallery() {
         buttons: `<button type="button" class="btn primary" data-act="album-pick">${icon('photos')}보관함에서 고르기</button><button type="button" class="btn" data-act="album-upload">${icon('upload')}기기에서 올리기</button>`,
       },
       trash: { ic: 'trash', title: '휴지통이 비어 있어요', text: '삭제한 항목은 여기에서 30일 동안 복원할 수 있어요.' },
+      search: { ic: 'search', title: '검색 결과가 없어요', text: `‘${esc(searchQuery)}’와 일치하는 사진이 없어요.<br>‘2025년 10월’, ‘동영상’, 앨범 이름처럼 검색해 보세요.` },
     }[route.name];
     main.innerHTML = html + emptyHTML(empty);
     return;
@@ -386,6 +506,116 @@ function renderGallery() {
   main.innerHTML = html;
   updateDayChecks(main, sel.ids);
   mainThumbs.observe(main);
+}
+
+let memoryGroups = [];
+
+function memoriesHTML() {
+  memoryGroups = memories();
+  if (!memoryGroups.length) return '';
+  return `<section class="memories" aria-label="추억">
+    <h2 class="memories-title">${icon('restore')}추억</h2>
+    <div class="memory-row">${memoryGroups.map((g, i) => {
+      const url = thumbURL(g.items.find((m) => m.thumb) || g.items[0]);
+      return `<button type="button" class="memory" data-act="memory" data-i="${i}">
+        ${url ? `<img src="${url}" alt="" draggable="false">` : ''}
+        <span class="memory-text"><strong>${g.years}년 전 ${g.exact ? '오늘' : '이맘때'}</strong><small>${new Date(g.items[0].takenAt).getFullYear()}년 · ${fmtNum(g.items.length)}개</small></span>
+      </button>`;
+    }).join('')}</div>
+  </section>`;
+}
+
+function searchSuggestionsHTML() {
+  const active = lib.activeMedia();
+  const year = new Date().getFullYear();
+  const chips = [];
+  if (active.some((m) => m.kind === 'video')) chips.push(['video', '동영상']);
+  if (active.some((m) => m.favorite)) chips.push(['heart', '즐겨찾기']);
+  if (active.some((m) => m.edited || m.editedAt)) chips.push(['tune', '편집']);
+  if (active.some((m) => /screenshot|스크린샷|캡처/i.test(m.name))) chips.push(['image', '스크린샷']);
+  if (active.some((m) => new Date(m.takenAt).getFullYear() === year)) chips.push(['event', '올해']);
+  if (active.some((m) => new Date(m.takenAt).getFullYear() === year - 1)) chips.push(['event', '작년']);
+  const months = [];
+  for (const m of active) {
+    const d = new Date(m.takenAt);
+    const label = `${d.getFullYear()}년 ${d.getMonth() + 1}월`;
+    if (!months.includes(label)) months.push(label);
+    if (months.length >= 8) break;
+  }
+  const chip = (ic, label) => `<button type="button" class="chip" data-act="search-chip" data-q="${esc(label)}">${icon(ic)}${esc(label)}</button>`;
+  if (!active.length) return emptyHTML({ ic: 'search', title: '검색할 사진이 없어요', text: '사진을 추가하면 날짜, 앨범, 이름으로 찾을 수 있어요.' });
+  return `<div class="page">
+    ${chips.length ? `<h3 class="section-title">빠른 검색</h3><div class="chips">${chips.map(([ic, l]) => chip(ic, l)).join('')}</div>` : ''}
+    ${store.albums.length ? `<h3 class="section-title">앨범</h3><div class="chips">${store.albums.map((a) => chip('albums', a.name)).join('')}</div>` : ''}
+    <h3 class="section-title">날짜</h3><div class="chips">${months.map((l) => chip('event', l)).join('')}</div>
+    <p class="footer-note">여러 단어를 띄어 쓰면 모두 맞는 사진만 보여줘요 (예: 2025년 여행)</p>
+  </div>`;
+}
+
+let searchTimer = 0;
+function onSearchInput(value) {
+  searchQuery = value;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    list = computeList();
+    renderMain();
+    const has = !!searchQuery;
+    const clearBtn = appbar.querySelector('[data-act="clear-search"]');
+    if (has && !clearBtn) appbar.insertAdjacentHTML('beforeend', iconBtn('clear-search', 'close', '검색어 지우기'));
+    if (!has && clearBtn) clearBtn.remove();
+  }, 140);
+}
+
+function setSearch(q) {
+  const input = appbar.querySelector('#search-input');
+  if (input) input.value = q;
+  onSearchInput(q);
+}
+
+function segmented(act, options, current) {
+  return `<div class="segmented" role="radiogroup">${Object.entries(options).map(([v, label]) => `<button type="button" role="radio" aria-checked="${v === String(current)}" class="${v === String(current) ? 'on' : ''}" data-act="${act}" data-v="${v}">${label}</button>`).join('')}</div>`;
+}
+
+function renderSettings() {
+  const active = lib.activeMedia();
+  const t = lib.totals(active);
+  const lockOn = lock.isLockEnabled();
+  main.innerHTML = `
+    <div class="page">
+      <h3 class="section-title">화면</h3>
+      <section class="card">
+        <div class="setting"><div><strong>테마</strong><small>밝은 화면과 어두운 화면 중에 골라요</small></div></div>
+        ${segmented('set-theme', THEMES, prefs.theme)}
+        <div class="setting gap"><div><strong>사진 크기</strong><small>사진 탭에서 두 손가락으로 벌리거나 오므려도 바뀌어요</small></div></div>
+        ${segmented('set-grid', GRID_SIZES, prefs.grid)}
+      </section>
+
+      <h3 class="section-title">보안</h3>
+      <section class="card list">
+        <button type="button" class="row" data-act="lock-toggle" role="switch" aria-checked="${lockOn}">
+          ${icon('lock')}<div><strong>앱 잠금</strong><small>앱을 열 때 PIN 4자리를 입력하게 해요</small></div>
+          <span class="switch${lockOn ? ' on' : ''}"><i></i></span>
+        </button>
+        ${lockOn ? `
+          ${row('lock-change', 'edit', 'PIN 변경', '새 PIN 4자리로 바꿔요')}
+          <div class="row static">${icon('event')}<div><strong>자동 잠금</strong><small>다른 앱으로 갔다가 돌아왔을 때</small>
+            ${segmented('lock-delay', Object.fromEntries(lock.LOCK_DELAYS.map(([ms, l]) => [String(ms), l])), String(lock.lockDelay()))}</div></div>` : ''}
+      </section>
+      ${lockOn ? '<p class="setting-note">앱 잠금은 다른 사람이 앱 화면을 보지 못하게 막는 기능이에요. PIN을 잊으면 모든 데이터를 지워야 하니, 백업 파일을 꼭 만들어 두세요.</p>' : ''}
+
+      <h3 class="section-title">저장공간</h3>
+      <section class="card list">
+        <div class="row static">${icon('storage')}<div><strong>보관 중</strong><small>${fmtCounts(t)} · ${fmtBytes(t.bytes)}</small></div></div>
+        ${t.edited ? `<div class="row static">${icon('tune')}<div><strong>편집한 사진의 원본</strong><small>${fmtNum(t.edited)}개 · ${fmtBytes(t.originalBytes)} · 사진 화면의 ⋮ → ‘원본으로 되돌리기’로 복원할 수 있어요</small></div></div>` : ''}
+        <a class="row" href="#/trash">${icon('trash')}<div><strong>휴지통</strong><small>${fmtNum(lib.trashedMedia().length)}개 · ${lib.TRASH_DAYS}일 후 자동 삭제</small></div>${icon('chevronRight', 'row-chev')}</a>
+        <button type="button" class="row danger" data-act="wipe">${icon('trash')}<div><strong>모든 데이터 삭제</strong><small>이 기기에 보관한 사진, 앨범, 설정을 모두 지워요</small></div></button>
+      </section>
+
+      <h3 class="section-title">정보</h3>
+      <section class="card list">
+        <div class="row static">${icon('info')}<div><strong>사진 보관함 ${APP_VERSION}</strong><small>모든 사진은 이 기기에만 저장되며 외부 서버로 전송되지 않아요.</small></div></div>
+      </section>
+    </div>`;
 }
 
 function albumCard(href, name, count, cover, ic) {
@@ -402,7 +632,8 @@ function renderAlbums() {
   const trash = lib.trashedMedia();
   const mine = store.albums.map((a) => {
     const items = active.filter((m) => m.albums.includes(a.id));
-    return albumCard(`#/album/${encodeURIComponent(a.id)}`, a.name, `${fmtNum(items.length)}개`, items[0], 'albums');
+    const cover = items.find((m) => m.id === a.coverId) || items[0];
+    return albumCard(`#/album/${encodeURIComponent(a.id)}`, a.name, `${fmtNum(items.length)}개`, cover, 'albums');
   }).join('');
   main.innerHTML = `
     <div class="page wide">
@@ -653,13 +884,19 @@ function onTileClick(tile, e) {
 /* ---------- 뷰어 ---------- */
 
 function openViewerAt(i) {
-  if (viewer || !list[i]) return;
-  lastViewedId = list[i].id;
+  if (!list[i]) return;
+  openViewer(list.map((m) => m.id), i);
+}
+
+function openViewer(ids, index, { slideshow = false } = {}) {
+  if (viewer || !ids[index]) return;
+  lastViewedId = ids[index];
   viewer = new Viewer({
-    ids: list.map((m) => m.id),
-    index: i,
+    ids,
+    index,
     mode: route.name === 'trash' ? 'trash' : 'normal',
     ctx: {
+      loadDetails: loadPhotoDetails,
       get: (id) => store.byId.get(id),
       thumbURL,
       loadOriginal: lib.getOriginal,
@@ -675,6 +912,109 @@ function openViewerAt(i) {
     v?.destroy();
     revealTile(lastViewedId);
   });
+  if (slideshow) setTimeout(() => viewer?.startSlideshow(), 400);
+}
+
+async function loadPhotoDetails(m) {
+  const blob = await lib.getExifSource(m.id);
+  const ex = blob ? await readExifDetails(blob) : null;
+  if (!ex) return [];
+  const rows = [];
+  const camera = ex.model && ex.make && !ex.model.toLowerCase().startsWith(ex.make.toLowerCase())
+    ? `${ex.make} ${ex.model}` : ex.model || ex.make;
+  if (camera) rows.push(['카메라', camera]);
+  if (ex.lens && ex.lens !== camera) rows.push(['렌즈', ex.lens]);
+  const shot = [];
+  if (ex.fNumber) shot.push(`f/${Math.round(ex.fNumber * 10) / 10}`);
+  if (ex.exposure) shot.push(ex.exposure >= 1 ? `${Math.round(ex.exposure * 10) / 10}초` : `1/${Math.round(1 / ex.exposure)}초`);
+  if (ex.iso) shot.push(`ISO ${ex.iso}`);
+  if (ex.focal) shot.push(`${Math.round(ex.focal * 10) / 10}mm`);
+  if (shot.length) rows.push(['촬영 설정', shot.join(' · ')]);
+  if (ex.lat !== null) {
+    const lat = ex.lat.toFixed(5);
+    const lon = ex.lon.toFixed(5);
+    rows.push(['위치', `${lat}, ${lon}`, `https://www.google.com/maps?q=${lat},${lon}`]);
+  }
+  return rows;
+}
+
+/* ---------- 편집기 ---------- */
+
+async function openEditor(id) {
+  const m = store.byId.get(id);
+  if (!m || m.kind !== 'image' || editor) return;
+  const blob = await lib.getOriginal(id);
+  if (!blob) return;
+  let instance = null;
+  let allowClose = false;
+  const closeLayer = () => {
+    if (instance && instance.dirty && !allowClose) {
+      // 뒤로가기로 닫으려 할 때 저장하지 않은 내용이 있으면 물어봅니다.
+      pushLayer(closeLayer);
+      instance.confirmDiscard().then((ok) => {
+        if (ok) {
+          allowClose = true;
+          popLayer();
+        }
+      });
+      return;
+    }
+    instance?.destroy();
+    editor = null;
+  };
+  try {
+    editor = 'opening';
+    instance = await Editor.open({
+      blob,
+      type: m.type,
+      name: m.name,
+      onCancel: () => {
+        allowClose = true;
+        popLayer();
+      },
+      onSave: async (out, asCopy) => {
+        const saved = await lib.saveEdit(id, out, { asCopy });
+        allowClose = true;
+        popLayer();
+        if (asCopy) {
+          toast('사본으로 저장했어요', {
+            action: '보기',
+            onAction: () => {
+              if (!viewer) return;
+              viewer.ids.splice(viewer.index, 0, saved.id);
+              viewer.fill(true);
+            },
+          });
+        } else {
+          viewer?.reloadCurrent();
+          toast('편집한 사진을 저장했어요. 원본은 ⋮ 메뉴에서 되돌릴 수 있어요.');
+        }
+      },
+    });
+    editor = instance;
+    pushLayer(closeLayer);
+  } catch (err) {
+    editor = null;
+    toast(err.message || '편집기를 열지 못했어요');
+  }
+}
+
+async function viewerMore(id) {
+  const m = store.byId.get(id);
+  if (!m) return;
+  const items = [];
+  if (route.name !== 'trash') {
+    items.push({ label: '앨범에 추가', icon: 'albums', value: 'album' });
+    items.push({ label: '기기에 저장', icon: 'download', value: 'download' });
+    if (viewer && viewer.ids.length > 1) items.push({ label: '슬라이드쇼', icon: 'slideshow', value: 'slideshow' });
+    items.push({ label: '날짜 및 시간 변경', icon: 'event', value: 'date' });
+    if (route.name === 'album') items.push({ label: '앨범 표지로 설정', icon: 'image', value: 'cover' });
+    if (m.edited) items.push({ label: '원본으로 되돌리기', icon: 'restore', value: 'revert', hint: '편집하기 전 사진으로 돌아가요' });
+  } else {
+    items.push({ label: '기기에 저장', icon: 'download', value: 'download' });
+  }
+  const v = await actionSheet({ items });
+  if (v) onViewerAction(v, id);
 }
 
 function revealTile(id) {
@@ -704,6 +1044,35 @@ async function onViewerAction(act, id) {
       await addToAlbumFlow([id]);
       viewer?.refresh();
       break;
+    case 'more':
+      await viewerMore(id);
+      break;
+    case 'edit':
+      await openEditor(id);
+      break;
+    case 'slideshow':
+      viewer?.startSlideshow();
+      break;
+    case 'date': {
+      const t = await dateTimeDialog({ title: '날짜 및 시간 변경', value: m.takenAt });
+      if (t === null) return;
+      await lib.setTakenAt([id], t);
+      viewer?.refresh();
+      toast(`${fmtDateTime(t)}(으)로 바꿨어요`);
+      break;
+    }
+    case 'cover':
+      await lib.setAlbumCover(route.id, id);
+      toast('앨범 표지로 설정했어요');
+      break;
+    case 'revert': {
+      const ok = await confirmDialog({ title: '원본으로 되돌릴까요?', message: '편집한 내용이 사라지고 편집하기 전 사진으로 돌아가요.', ok: '되돌리기' });
+      if (!ok) return;
+      await lib.revertEdit(id);
+      viewer?.reloadCurrent();
+      toast('원본으로 되돌렸어요');
+      break;
+    }
     case 'delete':
       if (!(await confirmDialog({ title: '휴지통으로 이동할까요?', message: `${lib.TRASH_DAYS}일 동안 휴지통에서 복원할 수 있어요.`, ok: '삭제', danger: true }))) return;
       await lib.moveToTrash([id]);
@@ -1125,24 +1494,129 @@ async function galleryMenu() {
   for (const [k, label] of Object.entries(GRID_SIZES)) {
     items.push({ label: `보기 크기: ${label}`, icon: 'grid', value: `grid:${k}`, checked: prefs.grid === k });
   }
+  if (list.length > 1) items.push({ label: '슬라이드쇼', icon: 'slideshow', value: 'slideshow-all' });
   if (route.name === 'photos' && canPickFolder) items.push({ label: '폴더 통째로 추가', icon: 'folder', value: 'pick-folder' });
   if (route.name === 'album') {
     items.push({ label: '앨범 이름 바꾸기', icon: 'edit', value: 'rename-album' });
     items.push({ label: '앨범 삭제', icon: 'trash', value: 'delete-album', danger: true });
   }
+  if (route.name === 'photos') items.push({ label: '설정', icon: 'settings', value: 'settings' });
   const v = await actionSheet({ items });
   if (!v) return;
   if (v.startsWith('grid:')) {
-    prefs.grid = v.slice(5);
-    savePrefs();
-    document.documentElement.dataset.grid = prefs.grid;
+    setGrid(v.slice(5));
     return;
   }
   handleAction(v);
 }
 
-async function handleAction(act) {
+/** 그리드 크기 바꾸기. 화면 가운데 있던 사진이 계속 가운데 보이게 합니다. */
+function setGrid(size) {
+  if (!GRID_SIZES[size] || size === prefs.grid) return;
+  const anchor = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2)?.closest?.('.tile');
+  prefs.grid = size;
+  savePrefs();
+  document.documentElement.dataset.grid = size;
+  if (anchor?.isConnected) anchor.scrollIntoView({ block: 'center' });
+  scroller.refresh(main);
+}
+
+function stepGrid(dir) {
+  const i = GRID_ORDER.indexOf(prefs.grid);
+  setGrid(GRID_ORDER[Math.min(GRID_ORDER.length - 1, Math.max(0, i + dir))]);
+}
+
+/* 두 손가락으로 그리드 크기 조절 (휴대폰), Ctrl + 휠 (PC) */
+let pinch = null;
+const touchDist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+main.addEventListener('touchstart', (e) => {
+  if (e.touches.length === 2 && isGalleryRoute()) pinch = { d0: touchDist(e.touches), done: false };
+}, { passive: true });
+main.addEventListener('touchmove', (e) => {
+  if (!pinch || e.touches.length !== 2 || pinch.done) return;
+  const r = touchDist(e.touches) / pinch.d0;
+  if (r > 1.25 || r < 0.8) {
+    pinch.done = true;
+    stepGrid(r > 1 ? 1 : -1);
+  }
+}, { passive: true });
+main.addEventListener('touchend', (e) => {
+  if (e.touches.length < 2) pinch = null;
+});
+main.addEventListener('wheel', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || !isGalleryRoute()) return;
+  e.preventDefault();
+  if (Math.abs(e.deltaY) < 4) return;
+  const now = performance.now();
+  if (now - (main.lastZoom || 0) < 250) return;
+  main.lastZoom = now;
+  stepGrid(e.deltaY < 0 ? 1 : -1);
+}, { passive: false });
+
+async function handleAction(act, el) {
   switch (act) {
+    case 'search':
+      searchQuery = '';
+      location.hash = '#/search';
+      break;
+    case 'clear-search':
+      setSearch('');
+      appbar.querySelector('#search-input')?.focus();
+      break;
+    case 'search-chip':
+      setSearch(el?.dataset.q || '');
+      break;
+    case 'settings':
+      location.hash = '#/settings';
+      break;
+    case 'memory': {
+      const g = memoryGroups[+el?.dataset.i];
+      if (g) openViewer(g.items.map((m) => m.id), 0);
+      break;
+    }
+    case 'slideshow-all':
+      if (list.length) openViewer(list.map((m) => m.id), 0, { slideshow: true });
+      break;
+    case 'set-theme':
+      prefs.theme = el.dataset.v;
+      savePrefs();
+      applyTheme();
+      render();
+      break;
+    case 'set-grid':
+      prefs.grid = el.dataset.v;
+      savePrefs();
+      document.documentElement.dataset.grid = prefs.grid;
+      render();
+      break;
+    case 'lock-toggle':
+      if (lock.isLockEnabled()) {
+        if (!(await lock.verifyPin('앱 잠금 끄기'))) return;
+        await lock.disableLock();
+        toast('앱 잠금을 껐어요');
+      } else {
+        const pin = await lock.askNewPin();
+        if (!pin) return;
+        await lock.setPin(pin);
+        toast('앱 잠금을 켰어요. 다음에 앱을 열 때 PIN을 입력해요.');
+      }
+      render();
+      break;
+    case 'lock-change': {
+      if (!(await lock.verifyPin('PIN 변경'))) return;
+      const pin = await lock.askNewPin();
+      if (!pin) return;
+      await lock.setPin(pin);
+      toast('PIN을 바꿨어요');
+      break;
+    }
+    case 'lock-delay':
+      await lock.setDelay(+el.dataset.v);
+      render();
+      break;
+    case 'wipe':
+      await wipeFlow();
+      break;
     case 'add':
       uploadAlbumId = null;
       fileInput.click();
@@ -1307,11 +1781,11 @@ async function onSelectionAction(act) {
 
 appbar.addEventListener('click', (e) => {
   const a = e.target.closest('[data-act]');
-  if (a) handleAction(a.dataset.act);
+  if (a) handleAction(a.dataset.act, a);
 });
 selbar.addEventListener('click', (e) => {
   const a = e.target.closest('[data-act]');
-  if (a && !a.disabled) handleAction(a.dataset.act);
+  if (a && !a.disabled) handleAction(a.dataset.act, a);
 });
 tabbar.addEventListener('click', (e) => {
   const tab = e.target.closest('.tab');
@@ -1322,7 +1796,7 @@ tabbar.addEventListener('click', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (viewer || isModalOpen()) return;
+  if (viewer || editor || isModalOpen() || lock.isLocked()) return;
   if (e.key === 'Escape' && sel.active) exitSelection();
   else if ((e.ctrlKey || e.metaKey) && e.key === 'a' && isGalleryRoute() && list.length && !e.target.closest?.('input, textarea')) {
     e.preventDefault();
@@ -1359,6 +1833,28 @@ function buildTabbar() {
   ].map(([k, ic, label]) => `<a class="tab" href="#/${k}" data-tab="${k}">${icon(ic)}<span>${label}</span></a>`).join('');
 }
 
+async function wipeFlow({ fromLock = false } = {}) {
+  const ok = await confirmDialog({
+    title: fromLock ? 'PIN을 잊으셨나요?' : '모든 데이터를 삭제할까요?',
+    message: fromLock
+      ? 'PIN은 되찾을 수 없어요. 이 기기에 보관한 사진·앨범·설정을 모두 지우고 처음 상태로 되돌리면 다시 쓸 수 있어요. 백업 파일이 있다면 나중에 복원할 수 있어요.'
+      : '이 기기에 보관한 사진, 앨범, 휴지통, 설정이 모두 지워지며 되돌릴 수 없어요. 먼저 백업 파일을 만들어 두세요.',
+    ok: '모두 삭제',
+    danger: true,
+  });
+  if (!ok) return;
+  const again = await confirmDialog({ title: '정말 삭제할까요?', message: '마지막 확인이에요. 삭제한 사진은 복구할 수 없어요.', ok: '영구 삭제', danger: true });
+  if (!again) return;
+  await lib.wipeAll();
+  try {
+    localStorage.removeItem('pv-prefs');
+  } catch {
+    /* 무시 */
+  }
+  location.replace(`${location.pathname}#/photos`);
+  location.reload();
+}
+
 function showFatal(message) {
   main.innerHTML = emptyHTML({ ic: 'info', title: '보관함을 열 수 없어요', text: esc(message) });
 }
@@ -1375,6 +1871,12 @@ async function start() {
     cleanupThumbs();
     scheduleRender();
   });
+  let unlocked = Promise.resolve();
+  try {
+    if (await lock.initLock({ forgot: () => wipeFlow({ fromLock: true }) })) unlocked = lock.lock();
+  } catch {
+    /* 잠금 설정을 읽지 못하면 잠그지 않음 */
+  }
   try {
     await lib.load();
   } catch (err) {
@@ -1382,7 +1884,11 @@ async function start() {
     showFatal('브라우저 저장소를 열지 못했어요. 시크릿(비공개) 모드라면 일반 모드로 열어 주세요.');
     return;
   }
+  await unlocked;
   checkInbox();
+  window.addEventListener('resize', () => {
+    if (isGalleryRoute()) scroller.refresh(main);
+  });
 
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     const hadController = !!navigator.serviceWorker.controller;

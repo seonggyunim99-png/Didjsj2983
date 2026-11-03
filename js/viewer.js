@@ -36,7 +36,7 @@ export class Viewer {
       <div class="v-top">
         <button type="button" class="v-btn" data-act="close" aria-label="닫기">${icon('back')}</button>
         <div class="v-title"><strong></strong><small></small></div>
-        <button type="button" class="v-btn" data-act="download" aria-label="다운로드" title="다운로드">${icon('download')}</button>
+        <button type="button" class="v-btn" data-act="more" aria-label="더보기" title="더보기">${icon('more')}</button>
       </div>
       <button type="button" class="v-nav prev" data-act="prev" aria-label="이전">${icon('chevronLeft')}</button>
       <button type="button" class="v-nav next" data-act="next" aria-label="다음">${icon('chevronRight')}</button>
@@ -45,8 +45,8 @@ export class Viewer {
         <button type="button" class="v-btn labeled" data-act="info">${icon('info')}<span>정보</span></button>
         <button type="button" class="v-btn labeled" data-act="delete-forever">${icon('trash')}<span>영구 삭제</span></button>` : `
         <button type="button" class="v-btn labeled" data-act="favorite">${icon('heartOutline')}<span>즐겨찾기</span></button>
+        <button type="button" class="v-btn labeled" data-act="edit">${icon('tune')}<span>편집</span></button>
         <button type="button" class="v-btn labeled" data-act="share">${icon('share')}<span>공유</span></button>
-        <button type="button" class="v-btn labeled" data-act="album">${icon('albums')}<span>앨범</span></button>
         <button type="button" class="v-btn labeled" data-act="info">${icon('info')}<span>정보</span></button>
         <button type="button" class="v-btn labeled" data-act="delete">${icon('trash')}<span>삭제</span></button>`}
       </div>
@@ -205,6 +205,8 @@ export class Viewer {
       fav.innerHTML = `${icon(m.favorite ? 'heart' : 'heartOutline')}<span>즐겨찾기</span>`;
       fav.classList.toggle('active', !!m.favorite);
     }
+    const edit = this.root.querySelector('[data-act="edit"]');
+    if (edit) edit.disabled = m.kind !== 'image';
     this.root.querySelector('.v-nav.prev').hidden = this.index <= 0;
     this.root.querySelector('.v-nav.next').hidden = this.index >= this.ids.length - 1;
     if (!this.root.querySelector('.v-info').hidden) this.renderInfo();
@@ -213,6 +215,41 @@ export class Viewer {
   /** 외부에서 데이터가 바뀌었을 때 (예: 즐겨찾기) */
   refresh() {
     this.updateChrome();
+  }
+
+  /** 편집 등으로 현재 사진 파일이 바뀌었을 때 다시 불러옵니다. */
+  reloadCurrent() {
+    const id = this.ids[this.index];
+    const url = this.urls.get(id);
+    if (url) URL.revokeObjectURL(url);
+    this.urls.delete(id);
+    this.loading.delete(id);
+    this.slot.dataset.id = '';
+    this.renderSlot(this.slot, this.index);
+    this.resetZoom(false);
+    this.updateChrome();
+  }
+
+  /* ---------- 슬라이드쇼 ---------- */
+
+  startSlideshow() {
+    if (this.slideTimer || this.ids.length < 2) return;
+    this.root.classList.add('chrome-hidden', 'slideshow');
+    this.toggleInfo(false);
+    this.slideTimer = setInterval(() => {
+      if (this.index >= this.ids.length - 1) this.stopSlideshow();
+      else this.go(1);
+    }, 3500);
+    navigator.wakeLock?.request('screen').then((w) => { this.wake = w; }).catch(() => {});
+  }
+
+  stopSlideshow() {
+    if (!this.slideTimer) return;
+    clearInterval(this.slideTimer);
+    this.slideTimer = 0;
+    this.root.classList.remove('chrome-hidden', 'slideshow');
+    this.wake?.release?.().catch(() => {});
+    this.wake = null;
   }
 
   /** 현재 항목을 목록에서 빼고 다음 항목으로 넘어갑니다. */
@@ -305,6 +342,10 @@ export class Viewer {
   /* ---------- 제스처 ---------- */
 
   onDown(e) {
+    if (this.slideTimer) {
+      this.stopSlideshow();
+      return;
+    }
     if (this.animating || (e.pointerType === 'mouse' && e.button !== 0)) return;
     const video = e.target.closest('video');
     if (video) {
@@ -470,7 +511,11 @@ export class Viewer {
   }
 
   onKey(e) {
-    if (isModalOpen()) return;
+    if (isModalOpen() || document.body.classList.contains('editor-open') || document.body.classList.contains('locked')) return;
+    if (this.slideTimer) {
+      this.stopSlideshow();
+      if (e.key !== 'Escape') return;
+    }
     if (e.key === 'ArrowRight') this.go(1);
     else if (e.key === 'ArrowLeft') this.go(-1);
     else if (e.key === 'Escape') {
@@ -518,6 +563,7 @@ export class Viewer {
     if (m.kind === 'video' && m.duration) rows.push(['길이', fmtDuration(m.duration)]);
     const albums = this.ctx.albumNames(m);
     if (albums.length) rows.push(['앨범', albums.join(', ')]);
+    if (m.edited) rows.push(['편집', `${fmtDateTime(m.editedAt)}에 편집함 · 원본 보관 중`]);
     rows.push(['보관한 날', fmtDateTime(m.addedAt)]);
     rows.push(['백업 파일', m.exportedAt ? `${fmtDateTime(m.exportedAt)}에 내보냄` : '아직 내보내지 않음']);
     this.root.querySelector('.v-info').innerHTML = `
@@ -526,7 +572,15 @@ export class Viewer {
         <div class="v-info-head"><strong>상세 정보</strong>
           <button type="button" class="v-btn" data-act="info-close" aria-label="닫기">${icon('close')}</button></div>
         <dl>${rows.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
+        <dl class="v-exif"></dl>
       </div>`;
+    if (m.kind !== 'image' || !this.ctx.loadDetails) return;
+    const token = (this.infoToken = (this.infoToken || 0) + 1);
+    this.ctx.loadDetails(m).then((extra) => {
+      const box = this.root.querySelector('.v-exif');
+      if (!box || token !== this.infoToken || !extra?.length) return;
+      box.innerHTML = extra.map(([k, v, link]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}${link ? ` <a href="${esc(link)}" target="_blank" rel="noopener">지도에서 보기</a>` : ''}</dd></div>`).join('');
+    }).catch(() => {});
   }
 
   /* ---------- 종료 ---------- */
@@ -534,6 +588,7 @@ export class Viewer {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.stopSlideshow();
     clearTimeout(this.tapTimer);
     this.stage.removeEventListener('pointerdown', this.onDown);
     window.removeEventListener('pointermove', this.onMove);

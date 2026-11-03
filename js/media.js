@@ -85,7 +85,10 @@ function parseExifDateString(s) {
   return Number.isFinite(t) ? t : null;
 }
 
-function readTiffDate(dv, start) {
+const TIFF_SIZES = { 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8 };
+
+/** TIFF(EXIF) 구조를 읽어 태그 값을 꺼낼 수 있게 합니다. */
+function parseTiff(dv, start) {
   const le = dv.getUint16(start) === 0x4949;
   const u16 = (o) => dv.getUint16(start + o, le);
   const u32 = (o) => dv.getUint32(start + o, le);
@@ -93,34 +96,49 @@ function readTiffDate(dv, start) {
 
   const readIfd = (off) => {
     const tags = {};
+    if (!off || start + off + 2 > dv.byteLength) return tags;
     const n = u16(off);
     for (let i = 0; i < n; i++) {
       const e = off + 2 + i * 12;
-      tags[u16(e)] = e;
+      if (start + e + 12 > dv.byteLength) break;
+      const type = u16(e + 2);
+      const count = u32(e + 4);
+      const size = (TIFF_SIZES[type] || 1) * count;
+      tags[u16(e)] = { type, count, vo: size > 4 ? u32(e + 8) : e + 8 };
     }
     return tags;
   };
-  const readAscii = (e) => {
-    const count = u32(e + 4);
-    const valueOff = count > 4 ? u32(e + 8) : e + 8;
-    let s = '';
-    for (let i = 0; i < count - 1 && i < 32; i++) s += String.fromCharCode(dv.getUint8(start + valueOff + i));
-    return s;
+  const val = (t) => {
+    if (!t) return undefined;
+    const { type, count, vo } = t;
+    if (type === 2) {
+      let str = '';
+      for (let i = 0; i < count && i < 128; i++) {
+        const c = dv.getUint8(start + vo + i);
+        if (!c) break;
+        str += String.fromCharCode(c);
+      }
+      return str.trim();
+    }
+    const one = (k) => {
+      switch (type) {
+        case 1: case 7: return dv.getUint8(start + vo + k);
+        case 3: return u16(vo + k * 2);
+        case 4: return u32(vo + k * 4);
+        case 5: return u32(vo + k * 8) / (u32(vo + k * 8 + 4) || 1);
+        case 10: return dv.getInt32(start + vo + k * 8, le) / (dv.getInt32(start + vo + k * 8 + 4, le) || 1);
+        default: return undefined;
+      }
+    };
+    return count === 1 ? one(0) : Array.from({ length: Math.min(count, 8) }, (_, k) => one(k));
   };
-
   const ifd0 = readIfd(u32(4));
-  let value = null;
-  if (ifd0[0x8769] !== undefined) {
-    const exif = readIfd(u32(ifd0[0x8769] + 8));
-    if (exif[0x9003] !== undefined) value = parseExifDateString(readAscii(exif[0x9003]));
-    if (!value && exif[0x9004] !== undefined) value = parseExifDateString(readAscii(exif[0x9004]));
-  }
-  if (!value && ifd0[0x0132] !== undefined) value = parseExifDateString(readAscii(ifd0[0x0132]));
-  return value;
+  const exif = ifd0[0x8769] ? readIfd(val(ifd0[0x8769])) : {};
+  const gps = ifd0[0x8825] ? readIfd(val(ifd0[0x8825])) : {};
+  return { ifd0, exif, gps, val };
 }
 
-/** JPEG의 EXIF에서 촬영 일시를 읽습니다. */
-export async function readExifDate(blob) {
+async function readTiff(blob) {
   try {
     const dv = new DataView(await blob.slice(0, 256 * 1024).arrayBuffer());
     if (dv.getUint16(0) !== 0xffd8) return null;
@@ -129,13 +147,49 @@ export async function readExifDate(blob) {
       const marker = dv.getUint16(off);
       if ((marker & 0xff00) !== 0xff00 || marker === 0xffda) return null;
       const len = dv.getUint16(off + 2);
-      if (marker === 0xffe1 && dv.getUint32(off + 4) === 0x45786966) return readTiffDate(dv, off + 10);
+      if (marker === 0xffe1 && dv.getUint32(off + 4) === 0x45786966) return parseTiff(dv, off + 10);
       off += 2 + len;
     }
   } catch {
     /* 손상되었거나 EXIF가 없는 파일 */
   }
   return null;
+}
+
+/** JPEG의 EXIF에서 촬영 일시를 읽습니다. */
+export async function readExifDate(blob) {
+  const t = await readTiff(blob);
+  if (!t) return null;
+  return parseExifDateString(t.val(t.exif[0x9003]))
+    || parseExifDateString(t.val(t.exif[0x9004]))
+    || parseExifDateString(t.val(t.ifd0[0x0132]));
+}
+
+/** 사진 정보 화면용: 카메라, 렌즈, 촬영 설정, 위치 */
+export async function readExifDetails(blob) {
+  const t = await readTiff(blob);
+  if (!t) return null;
+  const { ifd0, exif, gps, val } = t;
+  const out = {
+    make: val(ifd0[0x010f]) || '',
+    model: val(ifd0[0x0110]) || '',
+    lens: val(exif[0xa434]) || '',
+    fNumber: val(exif[0x829d]),
+    exposure: val(exif[0x829a]),
+    iso: val(exif[0x8827]),
+    focal: val(exif[0x920a]),
+    lat: null,
+    lon: null,
+  };
+  if (Array.isArray(out.iso)) [out.iso] = out.iso;
+  const dms = (v) => (Array.isArray(v) && v.length >= 3 ? v[0] + v[1] / 60 + v[2] / 3600 : null);
+  const lat = dms(val(gps[2]));
+  const lon = dms(val(gps[4]));
+  if (lat !== null && lon !== null && (lat || lon)) {
+    out.lat = val(gps[1]) === 'S' ? -lat : lat;
+    out.lon = val(gps[3]) === 'W' ? -lon : lon;
+  }
+  return out;
 }
 
 /** MP4/MOV 동영상의 mvhd 상자에서 생성 일시를 읽습니다. */

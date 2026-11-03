@@ -68,12 +68,18 @@ export function totals(list) {
   let photos = 0;
   let videos = 0;
   let bytes = 0;
+  let originalBytes = 0;
+  let edited = 0;
   for (const m of list) {
     if (m.kind === 'video') videos++;
     else photos++;
     bytes += m.size;
+    if (m.edited) {
+      edited++;
+      originalBytes += m.originalSize || 0;
+    }
   }
-  return { photos, videos, bytes, count: list.length };
+  return { photos, videos, bytes, originalBytes, edited, count: list.length };
 }
 
 /* ---------- 가져오기 (백업) ---------- */
@@ -223,6 +229,135 @@ export async function deleteForever(ids, notify = true) {
   store.media = store.media.filter((m) => !gone.has(m.id));
   reindex();
   if (notify) emit();
+}
+
+/* ---------- 사진 편집 ---------- */
+
+function splitName(name) {
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? [name.slice(0, dot), name.slice(dot + 1)] : [name, ''];
+}
+const extFor = (type) => (type === 'image/png' ? 'png' : 'jpg');
+
+/**
+ * 편집 결과를 저장합니다.
+ * - 덮어쓰기: 처음 편집할 때의 원본을 따로 보관해서 '원본으로 되돌리기'가 가능해요.
+ * - 사본: 원본은 그대로 두고 같은 촬영 일시의 새 사진을 만들어요.
+ */
+export async function saveEdit(id, blob, { asCopy = false } = {}) {
+  const m = store.byId.get(id);
+  if (!m) throw new Error('사진을 찾을 수 없어요');
+  const info = await makeImageThumb(blob);
+  const now = Date.now();
+  if (asCopy) {
+    const hash = await hashBlob(blob);
+    const existing = await db.findByHash(hash);
+    if (existing) return store.byId.get(existing.id) || existing;
+    const [base] = splitName(m.originalName || m.name);
+    const rec = {
+      id: uid(),
+      hash,
+      name: `${base}_edit.${extFor(blob.type)}`,
+      type: blob.type,
+      kind: 'image',
+      size: blob.size,
+      width: info.width,
+      height: info.height,
+      duration: 0,
+      takenAt: m.takenAt,
+      addedAt: now,
+      favorite: false,
+      albums: [...m.albums],
+      deletedAt: null,
+      exportedAt: null,
+      thumb: info.thumb,
+      editedAt: now,
+    };
+    await db.addMedia(rec, blob);
+    store.media.push(rec);
+    reindex();
+    emit();
+    return rec;
+  }
+  const first = !m.edited;
+  await db.replaceBlob(id, blob, first);
+  if (first) {
+    m.originalSize = m.size;
+    m.originalType = m.type;
+    m.originalName = m.name;
+  }
+  const [base] = splitName(m.originalName || m.name);
+  Object.assign(m, {
+    size: blob.size,
+    type: blob.type,
+    name: `${base}.${extFor(blob.type)}`,
+    width: info.width,
+    height: info.height,
+    thumb: info.thumb,
+    edited: true,
+    editedAt: now,
+    exportedAt: null,
+  });
+  await db.putMedia(m);
+  emit();
+  return m;
+}
+
+export async function revertEdit(id) {
+  const m = store.byId.get(id);
+  if (!m?.edited) return false;
+  const orig = await db.getBlob(`orig:${id}`);
+  if (!orig) return false;
+  let info = null;
+  try {
+    info = await makeImageThumb(orig);
+  } catch {
+    info = null;
+  }
+  await db.restoreOriginal(id);
+  Object.assign(m, {
+    size: orig.size,
+    type: m.originalType || orig.type,
+    name: m.originalName || m.name,
+    width: info?.width || m.width,
+    height: info?.height || m.height,
+    thumb: info?.thumb || m.thumb,
+    edited: false,
+    editedAt: null,
+    exportedAt: null,
+    originalSize: 0,
+  });
+  delete m.originalType;
+  delete m.originalName;
+  await db.putMedia(m);
+  emit();
+  return true;
+}
+
+/** 사진 정보(EXIF)는 편집 전 원본에서 읽습니다. */
+export async function getExifSource(id) {
+  return (await db.getBlob(`orig:${id}`)) || db.getBlob(id);
+}
+
+export async function setTakenAt(ids, ms) {
+  const list = records(ids);
+  list.forEach((m) => { m.takenAt = ms; });
+  await db.putMedia(list);
+  reindex();
+  emit();
+}
+
+export async function setAlbumCover(albumId, mediaId) {
+  const album = getAlbum(albumId);
+  if (!album) return;
+  album.coverId = mediaId;
+  await db.putAlbum(album);
+  emit();
+}
+
+/** 모든 데이터를 지웁니다 (되돌릴 수 없음). */
+export async function wipeAll() {
+  await db.destroyAll();
 }
 
 /* ---------- 앨범 ---------- */
