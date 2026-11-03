@@ -68,6 +68,8 @@ export function defaultState() {
     enhance: { on: false, scene: 'auto', strength: 1, prev: null },
     heals: [],
     strokes: [],
+    liquify: [], // 손으로 모양 다듬기 획 (retouch.js)
+    local: [], // 부분 보정 브러시 획
   };
 }
 
@@ -81,6 +83,7 @@ export function isEdited(st) {
   const c = g.crop;
   return Object.values(st.adj).some((v) => v) || curveChanged(st.curve) || hslChanged(st.hsl) || !!gradingChanged(st.grading)
     || (st.look !== 'none' && st.lookAmt > 0) || st.heals.length > 0 || st.strokes.length > 0
+    || st.liquify?.length > 0 || st.local?.length > 0
     || g.q || g.flipH || g.flipV || g.angle || g.pv || g.ph
     || c.x > 1e-4 || c.y > 1e-4 || c.w < 0.9999 || c.h < 0.9999;
 }

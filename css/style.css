@@ -1961,3 +1961,14 @@ body.locked .scroller { visibility: hidden; }
 }
 .ed-slider-row.disabled { opacity: .38; }
 .ed-slider-row.disabled input { pointer-events: none; }
+
+/* 3.3 성형 · 부분 보정 브러시 */
+.ed-ring {
+  position: absolute; z-index: 3; pointer-events: none; border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, 0.9); box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45), inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+.editor[data-tab='reshape'] .ed-canvas, .editor[data-tab='local'] .ed-canvas { cursor: none; touch-action: none; }
+.editor.no-gpu .ed-tab[data-tab='reshape'], .editor.no-gpu .ed-tab[data-tab='local'] { display: none; }
+.ed-tabs { overflow-x: auto; scrollbar-width: none; }
+.ed-tabs::-webkit-scrollbar { display: none; }
+.editor .ed-tab { min-width: 44px; }

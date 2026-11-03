@@ -3,6 +3,7 @@
 import * as dv from './develop.js';
 import * as im from './imaging.js';
 import { buildWarps, buildMasks } from './face.js';
+import { WarpField, LocalMask, OpCache } from './retouch.js';
 
 /* ---------- 셰이더 ---------- */
 
@@ -24,6 +25,8 @@ uniform vec2 uSrcSize;
 uniform vec2 uOut;
 // 얼굴형 다듬기: a = (x, y, 반지름, 종류 0 확대·1 밀기), b = (밀기 x, y, 확대 세기) — 긴 변 기준 단위
 uniform int uOpN;
+uniform sampler2D uLiq; // 손으로 다듬은 변형 지도 (긴 변 = 1 단위)
+uniform int uHasLiq;
 uniform vec4 uOpA[40];
 uniform vec4 uOpB[40];
 vec2 warp(vec2 q) {
@@ -45,10 +48,9 @@ void main() {
   vec2 p = vec2(gl_FragCoord.x, uOut.y - gl_FragCoord.y);
   vec3 s = uInv * vec3(p, 1.0);
   vec2 sp = s.xy / s.z;
-  if (uOpN > 0) {
-    float M = max(uSrcSize.x, uSrcSize.y);
-    sp = warp(sp / M) * M;
-  }
+  float M = max(uSrcSize.x, uSrcSize.y);
+  if (uHasLiq == 1) sp += texture(uLiq, sp / uSrcSize).rg * M;
+  if (uOpN > 0) sp = warp(sp / M) * M;
   vec2 uv = sp / uSrcSize;
   vec4 c = texture(uSrc, uv);
   if (uv.x < -0.002 || uv.y < -0.002 || uv.x > 1.002 || uv.y > 1.002) c = vec4(0.0);
@@ -142,6 +144,7 @@ uniform sampler2D uSG;
 uniform sampler2D uNC;
 uniform sampler2D uMK1;
 uniform sampler2D uMK2;
+uniform sampler2D uLM;
 uniform sampler2D uLut;
 uniform vec2 uOut;
 uniform vec3 uWB;
@@ -150,7 +153,7 @@ uniform float uClarity, uTexture, uDehaze, uVib, uSat, uFade, uVig, uGrain, uSha
 uniform vec3 uHsl[8];
 uniform vec3 uGS, uGM, uGH;
 uniform float uBal;
-uniform int uHasHsl, uHasSkin, uHasNC, uHasFace;
+uniform int uHasHsl, uHasSkin, uHasNC, uHasFace, uHasLM, uShowLM;
 uniform float uDark, uBlush, uLips, uTeeth, uEyeB;
 
 vec3 toLin(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
@@ -221,6 +224,10 @@ void main() {
     dSmall *= 1.0 - uNoise * 0.8;
   }
 
+  // 부분 보정 브러시: x 밝기 · y 채도 · z 색온도 · w 디테일(+ 선명, - 매끄럽게)
+  vec4 lm = vec4(0.0);
+  if (uHasLM == 1) lm = clamp((texture(uLM, uv) * 255.0 - 128.0) / 127.0, -1.0, 1.0);
+
   // 얼굴 부위 영역 (얼굴 인식이 있을 때)
   vec4 k1 = vec4(0.0);
   vec4 k2 = vec4(0.0);
@@ -239,6 +246,13 @@ void main() {
     c = mix(c, c + (vec3(1.0) - c) * vec3(0.16, 0.13, 0.12) * uSkinTone, m);
     dSmall *= 1.0 - m * uSkin * 0.7;
   }
+  if (lm.w < -0.004) {
+    vec3 sb = texture(uSB, uv).rgb;
+    vec3 sg = texture(uSG, uv).rgb;
+    float k = min(1.0, -lm.w);
+    c = mix(c, sb + (c - sg) * 0.25, k);
+    dSmall *= 1.0 - k * 0.8;
+  }
 
   // 뷰티: 다크서클 · 볼 혈색 · 입술 · 치아 · 눈
   if (uHasFace == 1) {
@@ -255,8 +269,11 @@ void main() {
   }
 
   // 화이트밸런스 · 노출 (빛의 세기 그대로인 선형 공간에서)
-  float gainE = exp2(uExp);
-  c = toGam(toLin(c) * uWB * gainE);
+  float gainE = exp2(uExp + lm.x * 1.0);
+  vec3 lw = exp2(vec3(0.45, 0.0, -0.45) * lm.z);
+  lw /= dot(lw, vec3(0.2126, 0.7152, 0.0722));
+  c = toGam(toLin(c) * uWB * lw * gainE);
+  if (lm.x > 0.0) c += (1.0 - c) * (1.0 - c) * lm.x * 0.07; // 밝게: 아주 어두운 곳도 살짝 들어 올림
   vec2 bl = texture(uBL, uv).rg;
   float Lb = toGam1(toLin1(bl.r) * gainE);
   float Lm = toGam1(toLin1(texture(uBM, uv).r) * gainE);
@@ -332,7 +349,7 @@ void main() {
   // 생동감 · 채도 (생동감은 이미 진한 색과 피부색은 덜 건드림)
   float l2 = luma(c);
   float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
-  float f = 1.0 + uSat;
+  float f = (1.0 + uSat) * max(0.0, 1.0 + lm.y * 0.9);
   if (uVib > 0.0) f *= 1.0 + uVib * (1.0 - sat) * 1.1 * (1.0 - 0.5 * skinMask(c));
   else f *= 1.0 + uVib;
   c = l2 + (c - l2) * f;
@@ -349,7 +366,7 @@ void main() {
   c = c * (1.0 - uFade * 0.22) + uFade * 0.1;
 
   // 선명하게 (평평한 곳의 잡음은 키우지 않음)
-  c += uSharp * 1.7 * dSmall * smoothstep(0.002, 0.012, abs(dSmall));
+  c += (uSharp + max(lm.w, 0.0) * 0.9) * 1.7 * dSmall * smoothstep(0.002, 0.012, abs(dSmall));
 
   // 비네팅
   vec2 dv = (uv - 0.5) * 2.0 * uOut / max(uOut.x, uOut.y);
@@ -363,6 +380,12 @@ void main() {
     vec2 gp = gl_FragCoord.xy / gs;
     float nz = vnoise(gp + uSeed) * 0.6 + hash(gp + uSeed * 1.7) * 0.4 - 0.5;
     c += nz * uGrain * 0.16 * (1.0 - 0.6 * abs(2.0 * luma(c) - 1.0));
+  }
+
+  // 칠한 영역 보기
+  if (uShowLM == 1) {
+    float e = clamp(max(max(abs(lm.x), abs(lm.y)), max(abs(lm.z), abs(lm.w))) * 1.6, 0.0, 1.0);
+    c = mix(c, vec3(1.0, 0.18, 0.32), e * 0.5);
   }
 
   o = vec4(clamp(c, 0.0, 1.0), src.a);
@@ -543,7 +566,11 @@ export class GLRenderer {
     // 1) 기하 변환 (+ 얼굴형 다듬기)
     const faces = this.faces?.length ? this.faces : null;
     const warps = faces ? buildWarps(faces, a, this.W, this.H) : { n: 0 };
+    this.lastWarps = warps;
+    const liq = this.syncLiquify(st.liquify);
+    const geoTex = (src) => ({ uSrc: src, uLiq: liq ? this.liqTex : this.dummy });
     const geoSet = (p) => {
+      gl.uniform1i(p.u('uHasLiq'), liq ? 1 : 0);
       gl.uniformMatrix3fv(p.u('uInv'), false, transpose3(inv));
       gl.uniform2f(p.u('uSrcSize'), this.W, this.H);
       gl.uniform1i(p.u('uOpN'), warps.n);
@@ -553,7 +580,7 @@ export class GLRenderer {
       }
     };
     const A = this.target('A', outW, outH, false, true);
-    this.pass(this.prog.geo, A, outW, outH, { uSrc: this.srcTex }, geoSet);
+    this.pass(this.prog.geo, A, outW, outH, geoTex(this.srcTex), geoSet);
     // 얼굴 부위 영역도 같은 변형으로
     const beauty = ['skinSmooth', 'skinTone', 'darkCircle', 'blush', 'lips', 'teeth', 'eyeBright'].some((k) => a[k] > 0);
     let MK1 = null;
@@ -561,9 +588,16 @@ export class GLRenderer {
     if (faces && beauty) {
       this.ensureMasks();
       MK1 = this.target('MK1', outW, outH, false);
-      this.pass(this.prog.geo, MK1, outW, outH, { uSrc: this.mk1Tex }, geoSet);
+      this.pass(this.prog.geo, MK1, outW, outH, geoTex(this.mk1Tex), geoSet);
       MK2 = this.target('MK2', outW, outH, false);
-      this.pass(this.prog.geo, MK2, outW, outH, { uSrc: this.mk2Tex }, geoSet);
+      this.pass(this.prog.geo, MK2, outW, outH, geoTex(this.mk2Tex), geoSet);
+    }
+    // 부분 보정 영역도 같은 변형으로
+    const local = this.syncLocal(st.local);
+    let LM = null;
+    if (local) {
+      LM = this.target('LM', outW, outH, false);
+      this.pass(this.prog.geo, LM, outW, outH, geoTex(this.lmTex), geoSet);
     }
     gl.bindTexture(gl.TEXTURE_2D, A.tex);
     gl.generateMipmap(gl.TEXTURE_2D);
@@ -582,9 +616,10 @@ export class GLRenderer {
 
     // 3) 피부 보정용 (해상도와 관계없이 512px 기준으로 계산해서 미리보기와 저장 결과가 같게)
     const skin = a.skinSmooth > 0 || a.skinTone > 0;
+    const localSmooth = !!local && st.local.some((o) => o.t === 'smooth' || o.t === 'erase');
     let SB = null;
     let SG = null;
-    if (skin) {
+    if (skin || localSmooth) {
       const k = Math.min(1, 512 / Math.max(outW, outH));
       const kw = Math.max(1, Math.round(outW * k));
       const kh = Math.max(1, Math.round(outH * k));
@@ -620,7 +655,7 @@ export class GLRenderer {
     const hasHsl = P.hsl.some((v) => v.some((x) => x));
     const wb = dv.wbGains(a.temp, a.tint);
     this.pass(this.prog.develop, null, outW, outH, {
-      uImg: A.tex, uBL: BL.tex, uBM: BM.tex, uSB: SB ? SB.tex : this.dummy, uSG: SG ? SG.tex : this.dummy, uNC: NC ? NC.tex : this.dummy, uMK1: MK1 ? MK1.tex : this.dummy, uMK2: MK2 ? MK2.tex : this.dummy, uLut: this.lutTex,
+      uImg: A.tex, uBL: BL.tex, uBM: BM.tex, uSB: SB ? SB.tex : this.dummy, uSG: SG ? SG.tex : this.dummy, uNC: NC ? NC.tex : this.dummy, uMK1: MK1 ? MK1.tex : this.dummy, uMK2: MK2 ? MK2.tex : this.dummy, uLM: LM ? LM.tex : this.dummy, uLut: this.lutTex,
     }, (p) => {
       const f = (n, v) => gl.uniform1f(p.u(n), v);
       gl.uniform3f(p.u('uWB'), ...wb);
@@ -653,6 +688,8 @@ export class GLRenderer {
       gl.uniform1i(p.u('uHasSkin'), skin ? 1 : 0);
       gl.uniform1i(p.u('uHasNC'), NC ? 1 : 0);
       gl.uniform1i(p.u('uHasFace'), MK1 ? 1 : 0);
+      gl.uniform1i(p.u('uHasLM'), LM ? 1 : 0);
+      gl.uniform1i(p.u('uShowLM'), LM && this.showLocal ? 1 : 0);
       f('uDark', a.darkCircle / 100);
       f('uBlush', a.blush / 100);
       f('uLips', a.lips / 100);
@@ -660,6 +697,102 @@ export class GLRenderer {
       f('uEyeB', a.eyeBright / 100);
     });
     return { canvas: this.canvas, matrix: M };
+  }
+
+  /** 손으로 다듬은 변형 지도를 최신으로 (그리는 중에는 새로 그은 부분만 계산) */
+  syncLiquify(ops) {
+    if (!this.liqCache) this.liqCache = new OpCache((W, H) => new WarpField(W, H));
+    const f = this.liqCache.sync(ops, this.W, this.H);
+    if (!f) return null;
+    const gl = this.gl;
+    if (this.liqCache.changed || !this.liqTex || this.liqObj !== f) {
+      let full = this.liqCache.rebuilt || this.liqObj !== f;
+      if (!this.liqTex || this.liqDims !== `${f.fw}x${f.fh}`) {
+        full = true;
+        if (this.liqTex) gl.deleteTexture(this.liqTex);
+        this.liqTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this.liqTex);
+        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RG16F, f.fw, f.fh);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        this.liqDims = `${f.fw}x${f.fh}`;
+      }
+      gl.bindTexture(gl.TEXTURE_2D, this.liqTex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      // 그리는 중에는 바뀐 줄만 올림
+      const rows = f.takeRows();
+      const [y0, y1] = full || !rows ? [0, f.fh - 1] : rows;
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, y0, f.fw, y1 - y0 + 1, gl.RG, gl.FLOAT, f.data().subarray(y0 * f.fw * 2, (y1 + 1) * f.fw * 2));
+      this.liqObj = f;
+    }
+    return f;
+  }
+
+  syncLocal(ops) {
+    if (!this.lmCache) this.lmCache = new OpCache((W, H) => new LocalMask(W, H));
+    const m = this.lmCache.sync(ops, this.W, this.H);
+    if (!m) return null;
+    const gl = this.gl;
+    if (this.lmCache.changed || !this.lmTex || this.lmObj !== m) {
+      let full = this.lmCache.rebuilt || this.lmObj !== m;
+      if (!this.lmTex || this.lmDims !== `${m.fw}x${m.fh}`) {
+        full = true;
+        if (this.lmTex) gl.deleteTexture(this.lmTex);
+        this.lmTex = this.texture(m.fw, m.fh, false);
+        this.lmDims = `${m.fw}x${m.fh}`;
+      }
+      gl.bindTexture(gl.TEXTURE_2D, this.lmTex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      const rows = m.takeRows();
+      const [y0, y1] = full || !rows ? [0, m.fh - 1] : rows;
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, y0, m.fw, y1 - y0 + 1, gl.RGBA, gl.UNSIGNED_BYTE, m.data().subarray(y0 * m.fw * 4, (y1 + 1) * m.fw * 4));
+      this.lmObj = m;
+    }
+    return m;
+  }
+
+  /**
+   * 화면에서 누른 곳(원본 비율 좌표, 변형 전)이 실제 원본의 어디인지 (손 변형 · 얼굴형 다듬기 반영)
+   * 부분 보정·잡티 제거가 보이는 그대로의 자리에 칠해지도록 씀
+   */
+  warpPoint(nx, ny) {
+    const M = Math.max(this.W, this.H);
+    let x = (nx * this.W) / M;
+    let y = (ny * this.H) / M;
+    const f = this.liqCache?.obj;
+    if (f && !f.empty) {
+      const [dx, dy] = f.sample(x, y);
+      x += dx;
+      y += dy;
+    }
+    const w = this.lastWarps;
+    if (w?.n) {
+      let px = x;
+      let py = y;
+      for (let i = 0; i < w.n; i++) {
+        const ax = w.a[i * 4];
+        const ay = w.a[i * 4 + 1];
+        const r = w.a[i * 4 + 2];
+        const dx = x - ax;
+        const dy = y - ay;
+        const dist = Math.hypot(dx, dy);
+        if (dist >= r) continue;
+        const t = dist / r;
+        const k = 1 - t * t;
+        if (w.a[i * 4 + 3] < 0.5) {
+          px -= dx * w.b[i * 4 + 2] * k;
+          py -= dy * w.b[i * 4 + 2] * k;
+        } else {
+          px -= w.b[i * 4] * k * k;
+          py -= w.b[i * 4 + 1] * k * k;
+        }
+      }
+      x = px;
+      y = py;
+    }
+    return [(x * M) / this.W, (y * M) / this.H];
   }
 
   /** 얼굴 인식 결과(비율 좌표)를 알려 줍니다. null이면 얼굴 없음 */
@@ -738,6 +871,10 @@ class CPURenderer {
   trim() {}
 
   setFaces() {}
+
+  warpPoint(nx, ny) {
+    return [nx, ny];
+  }
 
   dispose() {}
 }
@@ -836,6 +973,8 @@ export function measure(renderer, st, region = st.geo.crop) {
  */
 export function renderFinal(renderer, src, W, H, st, maxPixels = 16_000_000) {
   renderer.setSource(src, W, H);
+  const show = renderer.showLocal;
+  renderer.showLocal = false; // '칠한 곳 보기' 표시는 저장하지 않음
   const [fw, fh] = dv.frameDims(W, H, st.geo);
   const cw = st.geo.crop.w * fw;
   const ch = st.geo.crop.h * fh;
@@ -847,6 +986,7 @@ export function renderFinal(renderer, src, W, H, st, maxPixels = 16_000_000) {
   ctx.drawImage(canvas, 0, 0);
   drawStrokes(ctx, canvas, st.strokes, matrix, W, H);
   renderer.trim();
+  renderer.showLocal = show;
   return out;
 }
 
