@@ -1,5 +1,6 @@
 // 여러 장 자동 보정: 보정 전/후 미리보기와 한꺼번에 적용
 import * as im from './imaging.js';
+import { previewEnhance, autoEnhanceBlob } from './glrender.js';
 import * as lib from './library.js';
 import { icon, esc, openModal, fmtNum, progress } from './ui.js';
 
@@ -61,7 +62,7 @@ export function reviewEnhance({ title, items, thumbURL, strength = 1, intro = ''
       if (!m?.thumb) return;
       try {
         if (!sources.has(id)) sources.set(id, await im.decode(m.thumb));
-        const out = im.previewEnhance(sources.get(id), { strength: level });
+        const out = previewEnhance(sources.get(id), { strength: level });
         const c = item.querySelector('canvas');
         c.width = out.width;
         c.height = out.height;
@@ -123,7 +124,7 @@ export async function runBatchEnhance(ids, { strength = 1, asCopy = false } = {}
     if (!m || m.kind !== 'image') continue;
     try {
       const blob = await lib.getOriginal(m.id);
-      const out = await im.autoEnhanceBlob(blob, m.type, { strength });
+      const out = await autoEnhanceBlob(blob, m.type, { strength });
       await lib.saveEdit(m.id, out, { asCopy });
       result.done++;
     } catch (err) {

@@ -1841,3 +1841,114 @@ body.locked .scroller { visibility: hidden; }
   cursor: pointer;
 }
 #boot-error small { display: block; margin-top: 18px; color: var(--text-3, #8a909c); font-size: 12px; word-break: break-all; }
+
+/* ======================================================================
+   3.1 보정 엔진: 편집 화면 (조정 묶음, 톤 커브, 색상별, 그레이딩, 히스토그램, 확대)
+   ====================================================================== */
+
+.editor .ed-panel {
+  justify-content: flex-start;
+  max-height: 46vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.editor[data-tab='enhance'] .ed-panel,
+.editor[data-tab='filter'] .ed-panel { justify-content: center; }
+.ed-group-body { display: flex; flex-direction: column; gap: 10px; }
+.ed-slider-label { cursor: pointer; user-select: none; }
+.ed-slider-row.changed .ed-slider-label { color: #8fb3ff; }
+.ed-slider-row input[data-track] { height: 6px; border-radius: 3px; }
+.ed-groups { padding-bottom: 2px; }
+.ed-chip.changed { position: relative; }
+.ed-chip.changed::after {
+  content: '';
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #6b9bff;
+}
+.ed-chip.on.changed::after { background: #2a5bd7; }
+.ed-dotmark, .ed-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 2px;
+  border-radius: 50%;
+  background: var(--dot, var(--c));
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+.ed-swatch { width: 12px; height: 12px; }
+
+.ed-dots { display: flex; justify-content: center; gap: 12px; padding: 2px 14px; flex-wrap: wrap; }
+.ed-dot {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 50%;
+  background: var(--c);
+  background-clip: padding-box;
+  cursor: pointer;
+}
+.ed-dot.on { border-color: #fff; box-shadow: 0 0 0 2px #4c84ff; }
+.ed-dot.changed::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -8px;
+  width: 5px;
+  height: 5px;
+  margin-left: -2.5px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.ed-curve-wrap { display: flex; justify-content: center; padding: 0 14px; }
+.ed-curve {
+  width: 100%;
+  max-width: 340px;
+  height: 220px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  touch-action: none;
+  cursor: crosshair;
+}
+
+.ed-hist {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 2;
+  width: 160px;
+  height: 70px;
+  border-radius: 8px;
+  pointer-events: none;
+  opacity: 0.92;
+}
+.editor.comparing .ed-hist { visibility: hidden; }
+.ed-zoom {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.editor[data-tab='beauty'] .ed-canvas { cursor: crosshair; }
+.editor .ed-tab { min-width: 0; }
+.editor .ed-tab span { font-size: 11.5px; }
+@media (max-width: 380px) {
+  .editor .ed-tab .ic { width: 22px; height: 22px; }
+  .editor .ed-tab span { font-size: 11px; }
+}

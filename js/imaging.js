@@ -351,6 +351,11 @@ export function analyze(img) {
   let sg = 0;
   let sb = 0;
   let mid = 0;
+  // 무채색에 가까운 부분(흰 벽, 회색 길, 구름 등)의 색 평균: 자동 화이트밸런스용 (선형 값)
+  let nr = 0;
+  let ng = 0;
+  let nb = 0;
+  let nn = 0;
   for (let p = 0, i = 0; p < n; p++, i += 4) {
     const r = d[i];
     const g = d[i + 1];
@@ -365,6 +370,12 @@ export function analyze(img) {
       sg += g;
       sb += b;
       mid++;
+      if (Math.max(r, g, b) - Math.min(r, g, b) < 0.16 * Math.max(r, g, b) + 6) {
+        nr += (r / 255) ** 2.2;
+        ng += (g / 255) ** 2.2;
+        nb += (b / 255) ** 2.2;
+        nn++;
+      }
     }
   }
   const pct = (q) => {
@@ -375,6 +386,20 @@ export function analyze(img) {
     }
     return 1;
   };
+  // 가장 밝은 3% (날아간 부분 제외)의 색 평균: 색이 크게 치우친 사진의 화이트밸런스용
+  const wpT = pct(0.97) * 255;
+  let wr = 0;
+  let wg = 0;
+  let wb = 0;
+  let wn = 0;
+  for (let p = 0, i = 0; p < n; p++, i += 4) {
+    if (gray[p] >= wpT && Math.max(d[i], d[i + 1], d[i + 2]) < 250) {
+      wr += (d[i] / 255) ** 2.2;
+      wg += (d[i + 1] / 255) ** 2.2;
+      wb += (d[i + 2] / 255) ** 2.2;
+      wn++;
+    }
+  }
   let low = 0;
   let high = 0;
   for (let v = 0; v < 10; v++) low += hist[v];
@@ -408,6 +433,13 @@ export function analyze(img) {
     mr: mid ? sr / mid / 255 : 0.5,
     mg: mid ? sg / mid / 255 : 0.5,
     mb: mid ? sb / mid / 255 : 0.5,
+    nR: nn ? nr / nn : 0,
+    nG: nn ? ng / nn : 0,
+    nB: nn ? nb / nn : 0,
+    nFrac: nn / n,
+    wR: wn ? wr / wn : 0,
+    wG: wn ? wg / wn : 0,
+    wB: wn ? wb / wn : 0,
     sharp: lc ? ls2 / lc - lm * lm : 0,
   };
 }
