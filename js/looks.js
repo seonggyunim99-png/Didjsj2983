@@ -33,6 +33,8 @@ export function pickStyle(st) {
     look: st.look,
     lookAmt: st.lookAmt,
     makeup: st.makeup,
+    sky: st.sky,
+    frame: st.frame,
   }));
 }
 
@@ -47,6 +49,8 @@ export function applyStyle(st, style) {
   st.look = s.look || 'none';
   st.lookAmt = s.lookAmt ?? 1;
   st.makeup = { ...d.makeup, ...s.makeup };
+  st.sky = s.sky || d.sky;
+  st.frame = { ...d.frame, ...s.frame };
   st.enhance = { ...st.enhance, on: false, prev: null };
   st.faceAdj = {};
   return st;
@@ -60,12 +64,16 @@ export function styleChanged(style) {
 
 /** 이 보정에 얼굴·몸·사람 인식이 필요한지 */
 export function styleNeeds(adj) {
-  const need = { faces: false, poses: false, person: false };
+  const need = { faces: false, poses: false, person: false, sky: false };
   for (const a of dv.ADJ) {
     if (!adj[a.key]) continue;
     if (a.face || a.key === 'skinSmooth' || a.key === 'skinTone') need.faces = true;
     if (a.pose) need.poses = true;
     if (a.seg) need.person = true;
+    if (a.sky) {
+      need.sky = true;
+      need.person = true; // 사람은 하늘에서 빼기 위해
+    }
   }
   return need;
 }

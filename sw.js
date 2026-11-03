@@ -1,5 +1,5 @@
 // 서비스 워커: 오프라인 실행 + 다른 앱에서 '공유'로 보낸 사진 받기
-const VERSION = 'v4.0.0';
+const VERSION = 'v5.0.0';
 const CACHE = `photo-vault-${VERSION}`;
 const SHELL = [
   './',
@@ -7,6 +7,7 @@ const SHELL = [
   './manifest.webmanifest',
   './css/style.css',
   './js/app.js',
+  './js/camera.js',
   './js/collage.js',
   './js/db.js',
   './js/develop.js',
@@ -23,6 +24,9 @@ const SHELL = [
   './js/retouch.js',
   './js/scroller.js',
   './js/ui.js',
+  './js/sky.js',
+  './js/upscale.js',
+  './js/videoedit.js',
   './js/viewer.js',
   './js/zip.js',
   './icons/icon.svg',

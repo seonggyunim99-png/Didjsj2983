@@ -48,6 +48,19 @@ const landmarker = () => task('face', (m, fs) => m.FaceLandmarker.createFromOpti
   runningMode: 'IMAGE',
   numFaces: 6,
 }));
+const landmarkerVideo = () => task('faceVideo', (m, fs) => m.FaceLandmarker.createFromOptions(fs, {
+  baseOptions: { modelAssetPath: `${VENDOR}face_landmarker.task`, delegate: 'CPU' },
+  runningMode: 'VIDEO',
+  numFaces: 3,
+}));
+
+/** 카메라 화면에서 실시간으로 얼굴 찾기 (뷰티 카메라) */
+export async function detectFacesVideo(video, time) {
+  const lm = await landmarkerVideo();
+  const res = lm.detectForVideo(video, time);
+  return (res.faceLandmarks || []).filter((f) => f.length >= 468).map((f) => f.map((p) => [p.x, p.y]));
+}
+
 const poser = () => task('pose', (m, fs) => m.PoseLandmarker.createFromOptions(fs, {
   baseOptions: { modelAssetPath: `${VENDOR}pose_landmarker_lite.task`, delegate: 'CPU' },
   runningMode: 'IMAGE',
@@ -84,31 +97,51 @@ export async function detectPoses(source) {
 }
 
 /**
- * 사람 영역 (배경 흐림용). 256px 결과를 사진 경계에 맞춰 다듬어 돌려줍니다.
- * @returns {Promise<{w:number, h:number, data:Uint8Array}|null>} 0 배경 ~ 255 사람
+ * 사람 영역과 부위 (배경 흐림 · 머리색 · 옷 색 · 피부 톤용).
+ * 256px 결과를 사진 경계(머리카락 등)에 맞춰 다듬어 돌려줍니다.
+ * @returns {Promise<{w:number, h:number, person:Uint8Array, hair:Uint8Array, clothes:Uint8Array, skin:Uint8Array}|null>} 0~255
  */
 export async function segmentPerson(source, W, H) {
   const sg = await segmenter();
   const res = sg.segment(source);
   const masks = res.confidenceMasks || [];
-  if (!masks.length) return null;
-  const bgMask = masks[0];
-  const mw = bgMask.width;
-  const mh = bgMask.height;
-  const bgv = bgMask.getAsFloat32Array();
-  const person = new Float32Array(mw * mh);
-  let any = 0;
-  for (let i = 0; i < person.length; i++) {
-    person[i] = 1 - bgv[i];
-    any += person[i] > 0.5 ? 1 : 0;
+  if (masks.length < 5) {
+    masks.forEach((m) => m.close());
+    return null;
   }
+  const mw = masks[0].width;
+  const mh = masks[0].height;
+  // 0 배경 · 1 머리카락 · 2 몸 피부 · 3 얼굴 피부 · 4 옷 · 5 기타(액세서리)
+  const cls = masks.map((m) => m.getAsFloat32Array().slice());
   masks.forEach((m) => m.close());
   res.close?.();
-  if (any < person.length * 0.005) return null;
-  // 사진 경계(머리카락 등)에 맞춰 다듬기: 가이드 필터
+  const n = mw * mh;
+  const person = new Float32Array(n);
+  const skin = new Float32Array(n);
+  let any = 0;
+  for (let i = 0; i < n; i++) {
+    person[i] = 1 - cls[0][i];
+    skin[i] = cls[2][i] + cls[3][i];
+    any += person[i] > 0.5 ? 1 : 0;
+  }
+  if (any < n * 0.005) return null;
+  // 사진 경계에 맞춰 다듬기: 가이드 필터 (회색조 사진을 기준으로)
   const k = Math.min(1, 768 / Math.max(W, H));
   const w = Math.max(8, Math.round(W * k));
   const h = Math.max(8, Math.round(H * k));
+  const I = grayGuide(source, w, h);
+  const r = Math.max(2, Math.round(Math.max(w, h) / 90));
+  const refine = (src, sharp) => {
+    const q = guidedFilter(I, upsample(src, mw, mh, w, h), w, h, r, 0.002);
+    const out = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) out[i] = Math.round(Math.min(1, Math.max(0, (q[i] - 0.5) * sharp + 0.5)) * 255);
+    return out;
+  };
+  return { w, h, person: refine(person, 1.6), hair: refine(cls[1], 1.4), clothes: refine(cls[4], 1.4), skin: refine(skin, 1.4) };
+}
+
+/** 가이드 필터용 회색조 사진 (0~1) */
+export function grayGuide(source, w, h) {
   const c = document.createElement('canvas');
   c.width = w;
   c.height = h;
@@ -117,6 +150,11 @@ export async function segmentPerson(source, W, H) {
   const img = ctx.getImageData(0, 0, w, h).data;
   const I = new Float32Array(w * h);
   for (let i = 0; i < w * h; i++) I[i] = (0.299 * img[i * 4] + 0.587 * img[i * 4 + 1] + 0.114 * img[i * 4 + 2]) / 255;
+  return I;
+}
+
+/** 작은 지도를 양선형으로 키움 */
+export function upsample(src, mw, mh, w, h) {
   const P = new Float32Array(w * h);
   for (let y = 0; y < h; y++) {
     const fy = Math.min(mh - 1.001, Math.max(0, ((y + 0.5) / h) * mh - 0.5));
@@ -127,19 +165,12 @@ export async function segmentPerson(source, W, H) {
       const x0 = Math.floor(fx);
       const tx = fx - x0;
       const i0 = y0 * mw + x0;
-      const a = person[i0] + (person[i0 + 1] - person[i0]) * tx;
-      const b2 = person[i0 + mw] + (person[i0 + mw + 1] - person[i0 + mw]) * tx;
+      const a = src[i0] + (src[i0 + 1] - src[i0]) * tx;
+      const b2 = src[i0 + mw] + (src[i0 + mw + 1] - src[i0 + mw]) * tx;
       P[y * w + x] = a + (b2 - a) * ty;
     }
   }
-  const q = guidedFilter(I, P, w, h, Math.max(2, Math.round(Math.max(w, h) / 90)), 0.002);
-  const data = new Uint8Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    // 경계를 조금 또렷하게
-    const v = Math.min(1, Math.max(0, (q[i] - 0.5) * 1.6 + 0.5));
-    data[i] = Math.round(v * 255);
-  }
-  return { w, h, data };
+  return P;
 }
 
 function boxFilter(src, w, h, r) {
@@ -167,7 +198,7 @@ function boxFilter(src, w, h, r) {
 }
 
 /** 가이드 필터 (He et al.): 거친 영역 P를 사진 I의 경계에 맞춰 다듬음 */
-function guidedFilter(I, P, w, h, r, eps) {
+export function guidedFilter(I, P, w, h, r, eps) {
   const n = w * h;
   const II = new Float32Array(n);
   const IP = new Float32Array(n);
@@ -569,6 +600,26 @@ export const SHADOW_COLORS = [
   ['pink', '핑크', [0.86, 0.58, 0.62]],
   ['orange', '오렌지', [0.88, 0.56, 0.38]],
   ['smoky', '스모키', [0.36, 0.33, 0.35]],
+];
+
+export const HAIR_COLORS = [
+  ['brown', '브라운', [0.46, 0.3, 0.2]],
+  ['ash', '애쉬브라운', [0.44, 0.38, 0.34]],
+  ['black', '블랙', [0.13, 0.12, 0.13]],
+  ['blonde', '블론드', [0.86, 0.71, 0.46]],
+  ['wine', '레드와인', [0.52, 0.16, 0.24]],
+  ['pink', '핑크', [0.92, 0.56, 0.66]],
+  ['blue', '애쉬블루', [0.4, 0.47, 0.6]],
+];
+export const CLOTH_COLORS = [
+  ['black', '블랙', [0.12, 0.12, 0.13]],
+  ['white', '화이트', [0.93, 0.93, 0.92]],
+  ['navy', '네이비', [0.16, 0.2, 0.36]],
+  ['beige', '베이지', [0.82, 0.72, 0.58]],
+  ['red', '레드', [0.75, 0.13, 0.16]],
+  ['green', '그린', [0.22, 0.45, 0.3]],
+  ['sky', '스카이', [0.5, 0.7, 0.9]],
+  ['pink', '핑크', [0.93, 0.6, 0.7]],
 ];
 
 /** 자동 뷰티: 티 나지 않게 자연스러운 정도 */

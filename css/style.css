@@ -1992,3 +1992,44 @@ body.locked .scroller { visibility: hidden; }
 .ed-split .l { right: 30px; }
 .ed-split .r { left: 30px; }
 .editor.splitting [data-act="compare"] { color: #8fb3ff; }
+.ed-mk.ed-sky i { background: var(--c); border-radius: 10px; width: 44px; }
+
+/* 5.0 꾸미기 · 여백 */
+.ed-frame { position: absolute; display: block; image-rendering: auto; box-shadow: 0 0 0 1px rgba(255,255,255,.08); }
+.ed-stickers { display: grid; grid-template-columns: repeat(auto-fill, minmax(44px, 1fr)); gap: 4px; padding: 4px 14px 8px; max-height: 150px; overflow-y: auto; }
+.ed-stk { border: 0; background: rgba(255,255,255,.06); border-radius: 10px; font-size: 26px; line-height: 1; padding: 8px 0; cursor: pointer; }
+.ed-stk.on { background: rgba(76,132,255,.35); }
+.editor[data-tab='draw'] .ed-canvas { cursor: pointer; }
+.ed-auto-big.ed-oneshot { background: linear-gradient(135deg, rgba(255,120,170,.22), rgba(120,140,255,.22)); }
+.ed-auto-big.ed-oneshot.on { background: linear-gradient(135deg, #ff6aa2, #6c7cff); }
+
+/* 5.0 뷰티 카메라 */
+.cam { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; background: #000; color: #fff; opacity: 0; transition: opacity .2s; }
+.cam.open { opacity: 1; }
+.cam-top { display: flex; align-items: center; justify-content: space-between; padding: calc(8px + var(--safe-t, 0px)) 10px 8px; }
+.cam-title { font-weight: 700; font-size: 15px; }
+.cam-icon { width: 44px; height: 44px; border: 0; border-radius: 50%; background: rgba(255,255,255,.1); color: #fff; display: grid; place-items: center; cursor: pointer; }
+.cam-stage { position: relative; flex: 1; min-height: 0; display: grid; place-items: center; overflow: hidden; }
+.cam-view { max-width: 100%; max-height: 100%; object-fit: contain; }
+.cam.mirror .cam-view { transform: scaleX(-1); }
+.cam-msg { position: absolute; padding: 0 24px; text-align: center; color: #c9ced6; font-size: 14px; }
+.cam-flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity .18s; }
+.cam.flash .cam-flash { opacity: .85; transition: none; }
+.cam-bottom { padding: 8px 0 calc(14px + var(--safe-b, 0px)); }
+.cam-chips { display: flex; gap: 8px; padding: 4px 14px; overflow-x: auto; scrollbar-width: none; align-items: center; }
+.cam-chips span { font-size: 12px; color: #aab2bf; flex: none; }
+.cam-chip { flex: none; border: 0; border-radius: 16px; padding: 7px 13px; background: rgba(255,255,255,.12); color: #fff; font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; }
+.cam-chip.on { background: #fff; color: #111; }
+.cam-shoot { display: flex; justify-content: center; padding-top: 10px; }
+.cam-shutter { width: 74px; height: 74px; border-radius: 50%; border: 4px solid #fff; background: transparent; padding: 5px; cursor: pointer; }
+.cam-shutter i { display: block; width: 100%; height: 100%; border-radius: 50%; background: #fff; transition: transform .1s; }
+.cam-shutter:active i { transform: scale(.9); }
+.cam-shutter:disabled { opacity: .5; }
+.cam-video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+/* 5.0 동영상 보정 */
+.vedit .ve-title { font-weight: 700; font-size: 15px; }
+.ve-bar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; }
+.ve-seek { flex: 1; accent-color: #4c84ff; }
+.ve-time { font-size: 12px; color: #aab2bf; font-variant-numeric: tabular-nums; min-width: 84px; text-align: right; }
+.vedit .ed-busy .ve-cancel { margin-top: 10px; }

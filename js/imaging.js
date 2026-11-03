@@ -602,7 +602,7 @@ export async function decode(blob) {
   }
 }
 
-export const dimsOf = (src) => [src.naturalWidth || src.width, src.naturalHeight || src.height];
+export const dimsOf = (src) => [src.naturalWidth || src.videoWidth || src.width, src.naturalHeight || src.videoHeight || src.height];
 
 export function canvasToBlob(canvas, type, quality = 0.95) {
   const png = type === 'image/png';

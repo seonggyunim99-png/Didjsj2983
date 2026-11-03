@@ -23,6 +23,9 @@ export const ADJ = [
   { g: 'effects', key: 'vignette', label: '비네팅' },
   { g: 'effects', key: 'grain', label: '그레인', min: 0 },
   { g: 'effects', key: 'fade', label: '페이드', min: 0 },
+  { g: 'effects', key: 'leak', label: '빛 번짐', min: 0 },
+  { g: 'effects', key: 'dust', label: '먼지·스크래치', min: 0 },
+  { g: 'sky', key: 'skyAmt', label: '하늘 바꾸기', min: 0, sky: true },
   { g: 'detail', key: 'sharpness', label: '선명하게', min: 0 },
   { g: 'detail', key: 'noise', label: '노이즈 감소', min: 0 },
   // 인물(뷰티): bg = 화면 묶음, face = 얼굴 인식이 있어야 쓸 수 있음
@@ -47,12 +50,16 @@ export const ADJ = [
   { g: 'beauty', bg: 'bg', key: 'bgBlur', label: '배경 흐림', min: 0, seg: true },
   { g: 'beauty', bg: 'bg', key: 'bgLight', label: '배경 밝기', seg: true },
   { g: 'beauty', bg: 'bg', key: 'bgMono', label: '배경 흑백', min: 0, seg: true },
+  { g: 'beauty', bg: 'color', key: 'hairAmt', label: '머리색', min: 0, seg: true, color: 'hair' },
+  { g: 'beauty', bg: 'color', key: 'clothAmt', label: '옷 색', min: 0, seg: true, color: 'cloth' },
+  { g: 'beauty', bg: 'color', key: 'skinShade', label: '피부 톤', seg: true },
+  { g: 'beauty', bg: 'color', key: 'skinWarm', label: '웜·쿨 톤', seg: true },
 ].map((a) => ({ min: -100, max: 100, ...a }));
 export const ADJ_BY_KEY = Object.fromEntries(ADJ.map((a) => [a.key, a]));
 
 export const GROUPS = [
   ['light', '빛'], ['color', '색상'], ['effects', '효과'], ['detail', '디테일'],
-  ['curve', '톤 커브'], ['hsl', '색상별'], ['grading', '컬러 그레이딩'],
+  ['curve', '톤 커브'], ['hsl', '색상별'], ['grading', '컬러 그레이딩'], ['sky', '하늘'],
 ];
 
 /** [키, 이름, 표시 색, 기준 색상(도)] */
@@ -62,7 +69,7 @@ export const HSL_BANDS = [
   ['purple', '보라', '#8b5cf6', 270], ['magenta', '자홍', '#d946ef', 300],
 ];
 
-export const BEAUTY_GROUPS = [['skin', '피부'], ['shape', '얼굴형'], ['parts', '눈·코·입'], ['makeup', '메이크업'], ['body', '몸매'], ['bg', '배경']];
+export const BEAUTY_GROUPS = [['skin', '피부'], ['shape', '얼굴형'], ['parts', '눈·코·입'], ['makeup', '메이크업'], ['color', '머리·옷·피부색'], ['body', '몸매'], ['bg', '배경']];
 /** 얼굴마다 따로 정할 수 있는 값 */
 export const FACE_KEYS = ADJ.filter((a) => a.face || ['skinSmooth', 'skinTone'].includes(a.key)).map((a) => a.key);
 
@@ -92,7 +99,10 @@ export function defaultState() {
     local: [], // 부분 보정 브러시 획
     erase: [], // 보정 지우개 획 (화면 자리 기준)
     faceAdj: {}, // 얼굴별 따로 정한 값 { 얼굴 번호: { 키: 값 } }
-    makeup: { lip: 'mlbb', blush: 'peach', shadow: 'brown' },
+    makeup: { lip: 'mlbb', blush: 'peach', shadow: 'brown', hair: 'brown', cloth: 'black' },
+    sky: 'blue', // 하늘 바꾸기 종류
+    items: [], // 글자 · 스티커 · 날짜 · 얼굴 가리기
+    frame: { aspect: 'none', fill: 'white', pad: 0 }, // 비율 맞추기 (여백)
   };
 }
 
@@ -106,7 +116,8 @@ export function isEdited(st) {
   const c = g.crop;
   return Object.values(st.adj).some((v) => v) || curveChanged(st.curve) || hslChanged(st.hsl) || !!gradingChanged(st.grading)
     || (st.look !== 'none' && st.lookAmt > 0) || st.heals.length > 0 || st.strokes.length > 0
-    || st.liquify?.length > 0 || st.local?.length > 0
+    || st.liquify?.length > 0 || st.local?.length > 0 || st.items?.length > 0
+    || (st.frame && st.frame.aspect !== 'none') || (st.frame?.pad > 0)
     || Object.values(st.faceAdj || {}).some((o) => Object.values(o).some((v) => v))
     || g.q || g.flipH || g.flipV || g.angle || g.pv || g.ph
     || c.x > 1e-4 || c.y > 1e-4 || c.w < 0.9999 || c.h < 0.9999;

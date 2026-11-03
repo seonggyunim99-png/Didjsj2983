@@ -16,30 +16,34 @@
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
   <link rel="icon" href="icons/icon-192.png" type="image/png" sizes="192x192">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-  <link rel="stylesheet" href="css/style.css?v=4.0.0">
+  <link rel="stylesheet" href="css/style.css?v=5.0.0">
   <!-- 배포할 때마다 버전을 올려서, 새 버전과 옛 버전 파일이 섞여 불러와지지 않게 합니다. -->
   <script type="importmap">
   {
     "imports": {
-      "./js/app.js": "./js/app.js?v=4.0.0",
-      "./js/collage.js": "./js/collage.js?v=4.0.0",
-      "./js/db.js": "./js/db.js?v=4.0.0",
-      "./js/develop.js": "./js/develop.js?v=4.0.0",
-      "./js/editor.js": "./js/editor.js?v=4.0.0",
-      "./js/enhance.js": "./js/enhance.js?v=4.0.0",
-      "./js/face.js": "./js/face.js?v=4.0.0",
-      "./js/glrender.js": "./js/glrender.js?v=4.0.0",
-      "./js/imaging.js": "./js/imaging.js?v=4.0.0",
-      "./js/inpaint.js": "./js/inpaint.js?v=4.0.0",
-      "./js/library.js": "./js/library.js?v=4.0.0",
-      "./js/retouch.js": "./js/retouch.js?v=4.0.0",
-      "./js/lock.js": "./js/lock.js?v=4.0.0",
-      "./js/looks.js": "./js/looks.js?v=4.0.0",
-      "./js/media.js": "./js/media.js?v=4.0.0",
-      "./js/scroller.js": "./js/scroller.js?v=4.0.0",
-      "./js/ui.js": "./js/ui.js?v=4.0.0",
-      "./js/viewer.js": "./js/viewer.js?v=4.0.0",
-      "./js/zip.js": "./js/zip.js?v=4.0.0"
+      "./js/app.js": "./js/app.js?v=5.0.0",
+      "./js/camera.js": "./js/camera.js?v=5.0.0",
+      "./js/collage.js": "./js/collage.js?v=5.0.0",
+      "./js/db.js": "./js/db.js?v=5.0.0",
+      "./js/develop.js": "./js/develop.js?v=5.0.0",
+      "./js/editor.js": "./js/editor.js?v=5.0.0",
+      "./js/enhance.js": "./js/enhance.js?v=5.0.0",
+      "./js/face.js": "./js/face.js?v=5.0.0",
+      "./js/glrender.js": "./js/glrender.js?v=5.0.0",
+      "./js/imaging.js": "./js/imaging.js?v=5.0.0",
+      "./js/inpaint.js": "./js/inpaint.js?v=5.0.0",
+      "./js/library.js": "./js/library.js?v=5.0.0",
+      "./js/retouch.js": "./js/retouch.js?v=5.0.0",
+      "./js/lock.js": "./js/lock.js?v=5.0.0",
+      "./js/looks.js": "./js/looks.js?v=5.0.0",
+      "./js/media.js": "./js/media.js?v=5.0.0",
+      "./js/scroller.js": "./js/scroller.js?v=5.0.0",
+      "./js/sky.js": "./js/sky.js?v=5.0.0",
+      "./js/ui.js": "./js/ui.js?v=5.0.0",
+      "./js/upscale.js": "./js/upscale.js?v=5.0.0",
+      "./js/videoedit.js": "./js/videoedit.js?v=5.0.0",
+      "./js/viewer.js": "./js/viewer.js?v=5.0.0",
+      "./js/zip.js": "./js/zip.js?v=5.0.0"
     }
   }
   </script>
@@ -47,7 +51,7 @@
     // 시작 안전장치: 앱이 시작하지 못하면 원인과 함께 '새로 불러오기' 버튼을 보여줍니다.
     (function () {
       var errors = [];
-      var MODULES = ['app', 'collage', 'db', 'develop', 'editor', 'enhance', 'face', 'glrender', 'imaging', 'inpaint', 'library', 'lock', 'looks', 'media', 'retouch', 'scroller', 'ui', 'viewer', 'zip'];
+      var MODULES = ['app', 'camera', 'collage', 'db', 'develop', 'editor', 'enhance', 'face', 'glrender', 'imaging', 'inpaint', 'library', 'lock', 'looks', 'media', 'retouch', 'scroller', 'sky', 'ui', 'upscale', 'videoedit', 'viewer', 'zip'];
       function show() {
         if (window.__pvReady || document.getElementById('boot-error') || !document.body) return;
         var box = document.createElement('div');
@@ -95,7 +99,7 @@
       setTimeout(show, 15000);
     })();
   </script>
-  <script type="module" src="js/app.js?v=4.0.0"></script>
+  <script type="module" src="js/app.js?v=5.0.0"></script>
 </head>
 <body>
   <header id="appbar" class="appbar"></header>

@@ -14,10 +14,12 @@ import * as lock from './lock.js';
 import { createScroller } from './scroller.js';
 import { reviewEnhance, runBatchEnhance, runBatchStyle, STRENGTHS } from './enhance.js';
 import * as looks from './looks.js';
+import { openCamera } from './camera.js';
+import { openVideoEditor } from './videoedit.js';
 import { openCollage } from './collage.js';
 import { canvasToBlob } from './imaging.js';
 
-const APP_VERSION = '4.0.0';
+const APP_VERSION = '5.0.0';
 
 const $ = (s, root = document) => root.querySelector(s);
 const appbar = $('#appbar');
@@ -409,7 +411,7 @@ function renderAppbar() {
     case 'photos':
       title = '사진';
       sub = counts();
-      actions = iconBtn('search', 'search', '검색') + iconBtn('add', 'add', '사진 추가') + iconBtn('menu', 'more', '더보기');
+      actions = iconBtn('camera', 'camera', '뷰티 카메라') + iconBtn('search', 'search', '검색') + iconBtn('add', 'add', '사진 추가') + iconBtn('menu', 'more', '더보기');
       break;
     case 'albums':
       title = '앨범';
@@ -1336,6 +1338,7 @@ async function openEditor(id) {
       type: base ? base.type : m.type,
       name: m.name,
       state: base?.state || null,
+      takenAt: m.takenAt,
       onCancel: () => {
         allowClose = true;
         popLayer();
@@ -1375,6 +1378,7 @@ async function viewerMore(id) {
     items.push({ label: '앨범에 추가', icon: 'albums', value: 'album' });
     items.push({ label: '기기에 저장', icon: 'download', value: 'download' });
     if (viewer && viewer.ids.length > 1) items.push({ label: '슬라이드쇼', icon: 'slideshow', value: 'slideshow' });
+    if (m.kind === 'video') items.push({ label: '동영상 보정', icon: 'tune', value: 'video-edit', hint: '필터 · 밝기 · 색감 · 피부 보정을 영상 전체에 적용해 새 동영상으로 저장' });
     items.push({ label: '날짜 및 시간 변경', icon: 'event', value: 'date' });
     if (route.name === 'album') items.push({ label: '앨범 표지로 설정', icon: 'image', value: 'cover' });
     if (m.edited) items.push({ label: '원본으로 되돌리기', icon: 'restore', value: 'revert', hint: '편집하기 전 사진으로 돌아가요' });
@@ -1396,10 +1400,49 @@ function revealTile(id) {
   if (r.top < 70 || r.bottom > window.innerHeight - 80) tile.scrollIntoView({ block: 'center' });
 }
 
+/* ---------- 뷰티 카메라 · 동영상 보정 ---------- */
+
+let cameraOpen = false;
+function cameraFlow() {
+  if (cameraOpen) return;
+  cameraOpen = true;
+  let count = 0;
+  const cam = openCamera({
+    onCapture: async (blob) => {
+      count++;
+      await runImport([{ blob, name: `camera-${stamp()}.jpg`, type: 'image/jpeg', takenAt: Date.now() }], '찍은 사진 저장하는 중');
+      toast('찍은 사진을 보관했어요');
+    },
+    onClose: () => {
+      cameraOpen = false;
+      if (count) toast(`${fmtNum(count)}장을 찍어 보관했어요`);
+    },
+  });
+  if (!cam) cameraOpen = false;
+}
+
+async function videoEditFlow(id) {
+  const m = store.byId.get(id);
+  if (!m || m.kind !== 'video') return;
+  const blob = await lib.getOriginal(id);
+  if (!blob) return;
+  openVideoEditor({
+    blob,
+    name: m.name,
+    onSave: async (out, name) => {
+      await runImport([{ blob: out, name, type: out.type, takenAt: m.takenAt + 1 }], '보정한 동영상 보관하는 중');
+      toast('보정한 동영상을 새로 저장했어요 (원본은 그대로)');
+    },
+  });
+}
+
 async function onViewerAction(act, id) {
   const m = store.byId.get(id);
   if (!m) return;
   switch (act) {
+    case 'video-edit':
+      await videoEditFlow(id);
+      break;
     case 'favorite':
       await lib.setFavorite([id], !m.favorite);
       viewer?.refresh();
@@ -2064,6 +2107,9 @@ async function handleAction(act, el) {
     case 'add':
       uploadAlbumId = null;
       fileInput.click();
+      break;
+    case 'camera':
+      cameraFlow();
       break;
     case 'pick-folder':
       folderInput.click();

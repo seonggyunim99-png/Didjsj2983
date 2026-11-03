@@ -4,10 +4,12 @@ import { icon, esc, toast, confirmDialog, actionSheet, isModalOpen, promptDialog
 import * as looks from './looks.js';
 import * as dv from './develop.js';
 import * as im from './imaging.js';
-import { createRenderer, measure, renderFinal, drawStrokes } from './glrender.js';
-import { detectFaces, detectPoses, segmentPerson, AUTO_BEAUTY, LIP_COLORS, BLUSH_COLORS, SHADOW_COLORS } from './face.js';
+import { createRenderer, measure, renderFinal, drawStrokes, drawItems, FRAME_ASPECTS, frameOn, frameDims } from './glrender.js';
+import { detectFaces, detectPoses, segmentPerson, AUTO_BEAUTY, LIP_COLORS, BLUSH_COLORS, SHADOW_COLORS, HAIR_COLORS, CLOTH_COLORS } from './face.js';
+import { SKIES, detectSky } from './sky.js';
 import { LIQ_TOOLS, LOCAL_TOOLS } from './retouch.js';
 import { removeArea } from './inpaint.js';
+import { upscale2x } from './upscale.js';
 
 const TABS = [
   ['enhance', 'auto', '보정'],
@@ -17,10 +19,19 @@ const TABS = [
   ['beauty', 'face', '인물'],
   ['reshape', 'touch', '성형'],
   ['local', 'magic', '부분'],
-  ['draw', 'brush', '그리기'],
+  ['draw', 'brush', '꾸미기'],
 ];
 const ASPECTS = [['free', '자유'], ['orig', '원본'], ['1:1', '1:1'], ['4:3', '4:3'], ['3:4', '3:4'], ['16:9', '16:9'], ['9:16', '9:16']];
-const TOOLS = [['pen', 'edit', '펜'], ['marker', 'brush', '형광펜'], ['mosaic', 'mosaic', '모자이크']];
+const TOOLS = [
+  ['text', 'edit', '글자'], ['sticker', 'face', '스티커'], ['date', 'event', '날짜'], ['cover', 'mosaic', '얼굴 가리기'],
+  ['frame', 'crop', '비율·여백'], ['pen', 'edit', '펜'], ['marker', 'brush', '형광펜'], ['mosaic', 'mosaic', '모자이크'],
+];
+const STICKERS = ['😊', '😍', '🥰', '😎', '🤩', '😂', '🥺', '😋', '❤️', '💕', '💖', '✨', '⭐', '🌟', '🔥', '🎉', '🎂', '🌸', '🌷', '🌈', '☀️', '🌙', '☁️', '🍀', '🐶', '🐱', '🐰', '🐻', '🍓', '🍰', '☕', '🍺', '👍', '✌️', '👑', '💯', '📍', '📸', '🎵', '🎀'];
+const TEXT_COLORS = ['#ffffff', '#111111', '#ff3b30', '#ff9500', '#ffcc00', '#34c759', '#0a84ff', '#bf5af2', '#ff7eb6'];
+const TEXT_FONTS = [['sans', '고딕'], ['serif', '명조'], ['hand', '손글씨'], ['round', '둥근']];
+const TEXT_STYLES = [['plain', '기본'], ['outline', '테두리'], ['box', '배경']];
+const COVER_MODES = [['mosaic', '모자이크'], ['blur', '흐림'], ['emoji', '스마일']];
+const ITEM_TOOLS = ['text', 'sticker', 'date', 'cover'];
 const COLORS = ['#ffffff', '#111111', '#ff3b30', '#ff9500', '#ffcc00', '#34c759', '#0a84ff', '#bf5af2'];
 const CURVE_CH = [['rgb', 'RGB', '#e5e7eb'], ['r', '빨강', '#ef4444'], ['g', '초록', '#22c55e'], ['b', '파랑', '#3b82f6']];
 const HANDLES = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
@@ -34,7 +45,8 @@ const TRACKS = {
 const WORK_MAX = 2048;
 const AUTO_GROUPS = ['skin', 'shape', 'parts'];
 const FACE_GROUPS = ['skin', 'shape', 'parts', 'makeup'];
-const MK_COLORS = { lip: LIP_COLORS, blush: BLUSH_COLORS, shadow: SHADOW_COLORS };
+const MK_COLORS = { lip: LIP_COLORS, blush: BLUSH_COLORS, shadow: SHADOW_COLORS, hair: HAIR_COLORS, cloth: CLOTH_COLORS };
+const MK_KEY = { lip: 'mkLip', blush: 'mkBlush', shadow: 'mkShadow', hair: 'hairAmt', cloth: 'clothAmt' };
 const css = (rgb) => `rgb(${rgb.map((v) => Math.round(v * 255)).join(',')})`;
 const MIN_CROP = 0.06;
 
@@ -102,7 +114,7 @@ export class Editor {
     return ed;
   }
 
-  constructor({ blob, type, name, state = null, onSave, onCancel }) {
+  constructor({ blob, type, name, state = null, takenAt = 0, onSave, onCancel }) {
     this.blob = blob;
     this.initState = state;
     this.type = type;
@@ -117,9 +129,13 @@ export class Editor {
     this.curveCh = 'rgb';
     this.band = 'red';
     this.gradeRange = 'shadows';
-    this.tool = 'pen';
     this.color = '#ff3b30';
     this.sizes = { pen: 6, marker: 18, mosaic: 26 };
+    this.tool = 'text';
+    this.selItem = -1; // 고른 글자·스티커
+    this.sticker = '😊';
+    this.coverMode = 'mosaic';
+    this.takenAt = takenAt || Date.now();
     this.healMode = false;
     this.healSize = 12;
     this.bgroup = 'skin';
@@ -136,6 +152,8 @@ export class Editor {
     this.poseState = 'idle';
     this.person = null;
     this.segState = 'idle';
+    this.sky = null;
+    this.skyState = 'idle';
     this.faceSel = -1; // 얼굴별 따로 보정: -1 = 모든 얼굴
     this.zoom = 1;
     this.pan = { x: 0, y: 0 };
@@ -158,6 +176,7 @@ export class Editor {
         <button type="button" class="btn primary sm" data-act="save">저장</button>
       </header>
       <div class="ed-stage">
+        <canvas class="ed-frame" width="2" height="2" hidden></canvas>
         <canvas class="ed-canvas"></canvas>
         <div class="ed-crop" hidden><i class="ed-grid"></i>${HANDLES.map((h) => `<span class="ed-h ed-h-${h}" data-h="${h}"></span>`).join('')}</div>
         <canvas class="ed-hist" width="160" height="70" hidden></canvas>
@@ -175,6 +194,7 @@ export class Editor {
     this.histEl = root.querySelector('.ed-hist');
     this.zoomEl = root.querySelector('.ed-zoom');
     this.ringEl = root.querySelector('.ed-ring');
+    this.frameEl = root.querySelector('.ed-frame');
     this.splitEl = root.querySelector('.ed-split');
     this.splitPos = 0.5;
     this.panel = root.querySelector('.ed-panel');
@@ -253,6 +273,7 @@ export class Editor {
     if (need.faces || Object.keys(st.faceAdj || {}).length) this.ensureFaces();
     if (need.poses) this.ensurePose();
     if (need.person) this.ensureSeg();
+    if (need.sky) this.ensureSky();
     if (dv.isEdited(st)) toast('지난번 편집을 이어서 고칠 수 있어요 · 모든 값이 그대로 남아 있어요', { duration: 3500 });
   }
 
@@ -262,7 +283,8 @@ export class Editor {
     if (need.faces || Object.keys(this.st.faceAdj || {}).length) this.ensureFaces();
     if (need.poses) this.ensurePose();
     if (need.person) this.ensureSeg();
-    for (let i = 0; i < 600 && [this.faceState, this.poseState, this.segState].includes('busy'); i++) {
+    if (need.sky) this.ensureSky();
+    for (let i = 0; i < 600 && [this.faceState, this.poseState, this.segState, this.skyState].includes('busy'); i++) {
       await new Promise((r) => setTimeout(r, 100));
     }
   }
@@ -296,13 +318,15 @@ export class Editor {
     const [fw, fh] = this.frame();
     const rw = region.w * fw;
     const rh = region.h * fh;
-    const fit = Math.min(sw / rw, sh / rh);
+    // 비율 맞추기(여백)가 있으면 여백까지 화면에 들어오게
+    const fr = this.tab !== 'crop' && frameOn(this.st.frame) ? frameDims(rw, rh, this.st.frame) : null;
+    const fit = fr ? Math.min(sw / fr[0], sh / fr[1]) : Math.min(sw / rw, sh / rh);
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     const maxPx = (this.renderer?.maxTex || 4096) / Math.max(rw, rh);
     const pxScale = Math.min(fit * this.zoom * dpr, 1, maxPx);
     this.canvas.width = Math.max(1, Math.round(rw * pxScale));
     this.canvas.height = Math.max(1, Math.round(rh * pxScale));
-    this.view = { rw, rh, fit, pxScale: this.canvas.width / rw, region };
+    this.view = { rw, rh, fit, pxScale: this.canvas.width / rw, region, frame: fr };
     this.applyView();
     this.cropEl.hidden = this.tab !== 'crop';
     this.baseDirty = true;
@@ -328,6 +352,18 @@ export class Editor {
     });
     this.view.cssW = cssW;
     this.view.cssH = cssH;
+    const fr = this.view.frame;
+    this.frameEl.hidden = !fr;
+    if (fr) {
+      const fwc = fr[0] * fit * this.zoom;
+      const fhc = fr[1] * fit * this.zoom;
+      Object.assign(this.frameEl.style, {
+        width: `${fwc}px`,
+        height: `${fhc}px`,
+        left: `${(W - fwc) / 2 + this.pan.x}px`,
+        top: `${(H - fhc) / 2 + this.pan.y}px`,
+      });
+    }
     this.zoomEl.hidden = this.zoom <= 1.01;
     this.zoomEl.textContent = `${Math.round(this.zoom * 100)}%`;
     if (this.tab === 'crop') this.positionCrop();
@@ -466,6 +502,22 @@ export class Editor {
     }
     const strokes = this.cur ? [...this.st.strokes, this.cur] : this.st.strokes;
     drawStrokes(ctx, this.glCanvas, strokes, this.matrix, this.Ww, this.Hw);
+    this.itemBoxes = drawItems(ctx, this.glCanvas, this.st.items, this.matrix, this.Ww, this.Hw);
+    if (this.tab === 'draw' && this.selItem >= 0) {
+      const b = this.itemBoxes.find((x) => x.i === this.selItem);
+      if (b) {
+        const pad = Math.max(4, c.width / 120);
+        ctx.save();
+        ctx.setLineDash([pad, pad * 0.7]);
+        ctx.lineWidth = Math.max(1.5, c.width / 400);
+        ctx.strokeStyle = '#ffffff';
+        ctx.shadowColor = 'rgba(0,0,0,0.6)';
+        ctx.shadowBlur = 3;
+        ctx.strokeRect(b.x0 - pad, b.y0 - pad, b.x1 - b.x0 + pad * 2, b.y1 - b.y0 + pad * 2);
+        ctx.restore();
+      }
+    }
+    if (this.frameEl) this.drawFramePreview();
     if (this.tab === 'beauty' && this.faces?.length > 1 && FACE_GROUPS.includes(this.bgroup) && !this.healMode && !this.eraseMode) this.drawFaceBadges(ctx);
     if (this.tab === 'crop') this.positionCrop();
     this.updateTop();
@@ -690,7 +742,28 @@ export class Editor {
   ensureDetect() {
     this.ensureFaces();
     if (this.bgroup === 'body') this.ensurePose();
-    if (this.bgroup === 'bg') this.ensureSeg();
+    if (this.bgroup === 'bg' || this.bgroup === 'color') this.ensureSeg();
+  }
+
+  /** 하늘 묶음을 처음 열 때 한 번 하늘을 찾습니다 (사람은 빼고) */
+  async ensureSky() {
+    if (this.skyState !== 'idle' || !this.work || !this.renderer?.gpu) return;
+    this.skyState = 'busy';
+    if (this.tab === 'adjust') this.renderPanel();
+    try {
+      await this.ensureSeg();
+      while (this.segState === 'busy') await new Promise((r) => setTimeout(r, 100));
+      if (this.destroyed) return;
+      this.sky = detectSky(this.work, this.Ww, this.Hw, this.person);
+      this.renderer.setSky(this.sky);
+      this.skyState = 'done';
+      this.invalidate();
+    } catch (err) {
+      console.warn('하늘 찾기 실패', err);
+      this.sky = null;
+      this.skyState = 'error';
+    }
+    if (!this.destroyed && this.tab === 'adjust') this.renderPanel();
   }
 
   /** 인물 탭 슬라이더 값 (얼굴을 골랐으면 그 얼굴 값) */
@@ -736,12 +809,17 @@ export class Editor {
     let html = '';
     if (this.tab === 'enhance') {
       const en = st.enhance;
+      const one = !!this.oneShotPrev;
       html = `
+        <button type="button" class="ed-auto-big ed-oneshot${one ? ' on' : ''}" data-act="one-shot" aria-pressed="${one}">
+          ${icon('magic')}<span><strong>원클릭 인생샷${one ? ' 켜짐' : ''}</strong><small>${one ? '한 번 더 누르면 원래대로 · 각 탭에서 세부 값을 바꿀 수 있어요' : '자동 보정 + 자연스러운 뷰티 + 인물이면 배경 살짝 흐림을 한 번에'}</small></span>
+        </button>
         <button type="button" class="ed-auto-big${en.on ? ' on' : ''}" data-act="auto" aria-pressed="${en.on}">
           ${icon('auto')}<span><strong>자동 보정${en.on ? ' 켜짐' : ''}</strong><small>${en.on ? '한 번 더 누르면 꺼져요 · 세부 값은 ‘조정’ 탭에서 바꿀 수 있어요' : '사진을 분석해서 노출·대비·화이트밸런스·색감을 알맞게 맞춰요'}</small></span>
         </button>
         <div class="ed-chips">${dv.SCENES.map((sc) => `<button type="button" class="ed-chip${en.on && en.scene === sc.id ? ' on' : ''}" data-scene="${sc.id}" title="${esc(sc.hint)}">${esc(sc.name)}</button>`).join('')}</div>
-        ${en.on ? this.sliderRow({ attrs: 'data-slider="strength"', label: '강도', value: Math.round(en.strength * 100), min: 0, max: 150, step: 5, text: `${Math.round(en.strength * 100)}`, reset: false }) : '<p class="ed-hint">장면을 고르면 그 장면에 맞게 보정해요</p>'}`;
+        ${en.on ? this.sliderRow({ attrs: 'data-slider="strength"', label: '강도', value: Math.round(en.strength * 100), min: 0, max: 150, step: 5, text: `${Math.round(en.strength * 100)}`, reset: false }) : '<p class="ed-hint">장면을 고르면 그 장면에 맞게 보정해요</p>'}
+        <div class="ed-chips"><button type="button" class="ed-chip" data-act="ai-upscale"${this.renderer?.gpu === false ? ' disabled' : ''}>${icon('auto')}AI 화질 개선 · 2배로 키우기</button></div>`;
     } else if (this.tab === 'crop') {
       const g = st.geo;
       html = `
@@ -797,11 +875,11 @@ export class Editor {
         busy = ps === 'busy';
         status = busy ? '몸을 찾는 중… (처음 한 번 약 6MB 내려받아요)' : ps === 'error' ? '자세 인식을 불러오지 못했어요'
           : !np ? '몸(어깨·골반)을 찾지 못했어요 · 전신이나 상반신이 보이는 사진에서 쓸 수 있어요' : `${np}명의 몸을 찾았어요 · 다리 길게는 골반과 무릎이 보여야 해요`;
-      } else if (bg === 'bg') {
+      } else if (bg === 'bg' || bg === 'color') {
         const ss = this.segState;
         busy = ss === 'busy';
         status = busy ? '사람과 배경을 나누는 중… (처음 한 번 약 16MB 내려받아요)' : ss === 'error' ? '배경 나누기를 불러오지 못했어요'
-          : !this.person ? '사람을 찾지 못했어요' : '사람과 배경을 나눴어요';
+          : !this.person ? '사람을 찾지 못했어요' : bg === 'color' ? '머리카락·옷·피부를 찾았어요 · 색을 고르면 바로 바뀌어요' : '사람과 배경을 나눴어요';
       }
       const rows = dv.ADJ.filter((a) => a.g === 'beauty' && a.bg === bg);
       const autoOn = this.beautyAuto();
@@ -886,15 +964,7 @@ export class Editor {
         </div>
         <p class="ed-hint">${C.tool === 'erase' ? '문지른 곳의 부분 보정을 지워요.' : '보정하고 싶은 곳만 문질러 주세요. 같은 곳을 여러 번 문지르면 더 강해져요.'}</p>`}`;
     } else if (this.tab === 'draw') {
-      html = `
-        <div class="ed-chips">
-          ${TOOLS.map(([k, ic, label]) => `<button type="button" class="ed-chip${this.tool === k ? ' on' : ''}" data-tool="${k}">${icon(ic)}${label}</button>`).join('')}
-          <button type="button" class="ed-chip" data-act="undo-stroke"${st.strokes.length ? '' : ' disabled'}>${icon('undo')}한 획 지우기</button>
-          <button type="button" class="ed-chip" data-act="clear-strokes"${st.strokes.length ? '' : ' disabled'}>${icon('trash')}모두 지우기</button>
-        </div>
-        <div class="ed-colors"${this.tool === 'mosaic' ? ' hidden' : ''}>${COLORS.map((c) => `<button type="button" class="ed-color${c === this.color ? ' on' : ''}" data-color="${c}" style="--c:${c}" aria-label="색 ${c}"></button>`).join('')}</div>
-        ${this.sliderRow({ attrs: 'data-slider="size"', label: '굵기', value: this.sizes[this.tool], min: 1, max: 40, text: `${this.sizes[this.tool]}`, reset: false })}
-        <p class="ed-hint">${this.tool === 'mosaic' ? '가리고 싶은 부분(얼굴, 번호판, 개인정보)을 문질러 주세요' : '사진 위에 손가락이나 마우스로 그려 보세요 (두 손가락으로 확대)'}</p>`;
+      html = this.decoPanel();
     }
     this.panel.innerHTML = html;
     this.panel.scrollTop = 0;
@@ -932,6 +1002,20 @@ export class Editor {
         ${this.sliderRow({ attrs: 'data-grade="h"', label: '색', value: h, min: 0, max: 360, text: `${h}°`, track: 'hue' })}
         ${this.sliderRow({ attrs: 'data-grade="s"', label: '강도', value: s, min: 0, max: 100, text: `${s}`, changed: !!s })}
         ${this.sliderRow({ attrs: 'data-grade="balance"', label: '균형', value: st.grading.balance, min: -100, max: 100, text: signed(st.grading.balance), changed: !!st.grading.balance })}`;
+    }
+    if (g === 'sky') {
+      this.ensureSky();
+      const ss = this.skyState;
+      const status = ss === 'busy' ? '하늘을 찾는 중… (처음 한 번 약 16MB 내려받아요)' : ss === 'error' ? '하늘을 찾지 못했어요'
+        : !this.sky ? '이 사진에서는 하늘을 찾지 못했어요 · 하늘이 위쪽에 넓게 보이는 야외 사진에서 쓸 수 있어요' : '하늘을 찾았어요 · 원하는 하늘을 골라 보세요';
+      const a = dv.ADJ_BY_KEY.skyAmt;
+      let row = this.adjRow(a);
+      if (!this.sky) row = row.replace('<input', '<input disabled').replace('ed-slider-row', 'ed-slider-row disabled');
+      return `
+        <p class="ed-face-status${ss === 'busy' ? ' busy' : ''}" aria-live="polite">${esc(status)}</p>
+        ${row}
+        ${this.sky ? `<div class="ed-mks">${SKIES.map(([id, name, d]) => `<button type="button" class="ed-mk ed-sky${st.sky === id ? ' on' : ''}" data-sky="${id}" style="--c:linear-gradient(${css(d.top)}, ${css(d.hor)})" aria-label="${esc(name)}"><i></i><span>${esc(name)}</span></button>`).join('')}</div>` : ''}
+        <p class="ed-hint">나무·철탑처럼 가는 물체가 많은 곳은 경계가 어색할 수 있어요. 앞쪽 색감도 하늘에 맞게 살짝 바뀌어요.</p>`;
     }
     return dv.ADJ.filter((a) => a.g === g).map((a) => this.adjRow(a)).join('');
   }
@@ -1202,6 +1286,25 @@ export class Editor {
         this.liq[r.dataset.slider === 'liqSize' ? 'size' : 'strength'] = v;
         out.textContent = `${v}`;
         break;
+      case 'itemSize': {
+        const it = st.items[this.selItem];
+        out.textContent = `${v}`;
+        if (!it) break;
+        const nv = 0.3 * (v / 100) ** 2;
+        if (it.t === 'cover') {
+          const k = nv / (it.rx || it.s);
+          it.rx = (it.rx || it.s) * k;
+          it.ry = (it.ry || it.s) * k;
+          it.s = Math.max(it.rx, it.ry);
+        } else it.s = nv;
+        this.requestPaint();
+        break;
+      }
+      case 'framePad':
+        st.frame = { ...st.frame, pad: v };
+        out.textContent = `${v}%`;
+        this.layout();
+        break;
       case 'erSize':
       case 'erStrength':
         this.er[r.dataset.slider === 'erSize' ? 'size' : 'strength'] = v;
@@ -1294,12 +1397,20 @@ export class Editor {
       this.requestPaint();
       return;
     }
+    if ((el = pick('[data-sky]'))) {
+      st.sky = el.dataset.sky;
+      if (!st.adj.skyAmt) st.adj.skyAmt = 100;
+      this.commit();
+      this.renderPanel();
+      this.invalidate();
+      return;
+    }
     if ((el = pick('[data-mk]'))) {
       const [kind, id] = el.dataset.mk.split(':');
       st.makeup = { ...(st.makeup || {}), [kind]: id };
       // 색을 고르면 바로 보이도록 진하기를 조금 올려 줌
-      const key = { lip: 'mkLip', blush: 'mkBlush', shadow: 'mkShadow' }[kind];
-      if (!this.beautyValue(key)) this.setBeauty(key, 50);
+      const key = MK_KEY[kind];
+      if (!this.beautyValue(key)) this.setBeauty(key, kind === 'hair' || kind === 'cloth' ? 80 : 50);
       this.commit();
       this.renderPanel();
       this.invalidate();
@@ -1345,7 +1456,55 @@ export class Editor {
     }
     if ((el = pick('[data-tool]'))) {
       this.tool = el.dataset.tool;
+      const it = st.items[this.selItem];
+      if (it && it.t !== this.tool) this.selItem = -1;
       this.renderPanel();
+      this.layout();
+      return;
+    }
+    if ((el = pick('[data-sticker]'))) {
+      this.sticker = el.dataset.sticker;
+      const it = st.items[this.selItem];
+      if (it?.t === 'sticker') {
+        it.emoji = this.sticker;
+        this.commit();
+        this.renderPanel();
+      } else {
+        const [x, y] = this.viewCenter();
+        this.addItem({ t: 'sticker', x, y, s: this.viewSize(0.12), emoji: this.sticker });
+      }
+      this.requestPaint();
+      return;
+    }
+    if ((el = pick('[data-item-color]')) || (el = pick('[data-item-font]')) || (el = pick('[data-item-style]'))) {
+      const it = st.items[this.selItem];
+      if (it) {
+        if (el.dataset.itemColor) it.color = el.dataset.itemColor;
+        if (el.dataset.itemFont) it.font = el.dataset.itemFont;
+        if (el.dataset.itemStyle) it.style = el.dataset.itemStyle;
+        this.commit();
+        this.renderPanel();
+        this.requestPaint();
+      }
+      return;
+    }
+    if ((el = pick('[data-cover-mode]'))) {
+      this.coverMode = el.dataset.coverMode;
+      const it = st.items[this.selItem];
+      // 고른 것이 있으면 그것만, 없으면 모든 가리기를 바꿈
+      for (const x of it?.t === 'cover' ? [it] : st.items.filter((y) => y.t === 'cover')) x.mode = this.coverMode;
+      this.commit();
+      this.renderPanel();
+      this.requestPaint();
+      return;
+    }
+    if ((el = pick('[data-frame-aspect]')) || (el = pick('[data-frame-fill]'))) {
+      st.frame = { ...st.frame };
+      if (el.dataset.frameAspect) st.frame.aspect = el.dataset.frameAspect;
+      if (el.dataset.frameFill) st.frame.fill = el.dataset.frameFill;
+      this.commit();
+      this.renderPanel();
+      this.layout();
       return;
     }
     if ((el = pick('[data-color]'))) {
@@ -1487,6 +1646,57 @@ export class Editor {
         this.eraseMode = false;
         this.healMode = !this.healMode;
         this.renderPanel();
+        break;
+      case 'one-shot':
+        this.oneShot();
+        break;
+      case 'ai-upscale':
+        this.aiUpscale();
+        break;
+      case 'add-text':
+        this.addText();
+        break;
+      case 'item-edit': {
+        const it = st.items[this.selItem];
+        if (!it) break;
+        promptDialog({ title: '글자 고치기', value: it.text, ok: '바꾸기' }).then((t) => {
+          if (!t) return;
+          it.text = String(t).slice(0, 80);
+          this.commit();
+          this.requestPaint();
+        });
+        break;
+      }
+      case 'item-delete':
+        if (this.selItem >= 0) st.items.splice(this.selItem, 1);
+        this.selItem = -1;
+        this.commit();
+        this.renderPanel();
+        this.requestPaint();
+        break;
+      case 'item-done':
+        this.selItem = -1;
+        this.renderPanel();
+        this.requestPaint();
+        break;
+      case 'toggle-date': {
+        const i = st.items.findIndex((x) => x.t === 'date');
+        if (i >= 0) {
+          st.items.splice(i, 1);
+          this.selItem = -1;
+          this.commit();
+          this.renderPanel();
+          this.requestPaint();
+        } else {
+          // 오른쪽 아래 (보이는 사진 기준)
+          const r = this.canvas.getBoundingClientRect();
+          const [x, y] = this.toSource({ clientX: r.left + r.width * 0.8, clientY: r.top + r.height * 0.92 });
+          this.addItem({ t: 'date', x, y, s: this.viewSize(0.05), text: this.dateText() });
+        }
+        break;
+      }
+      case 'cover-faces':
+        this.coverFaces();
         break;
       case 'copy-style':
         looks.setClip(st);
@@ -1795,9 +2005,40 @@ export class Editor {
         this.startOp(e);
         return;
       }
-      if (this.tab !== 'draw') return;
+      if (this.tab !== 'draw' || this.tool === 'frame') return;
       e.preventDefault();
       c.setPointerCapture(e.pointerId);
+      // 글자·스티커·가리기를 누르면 고르고 끌어서 옮김
+      const hit = this.hitItem(e);
+      if (hit >= 0) {
+        this.selItem = hit;
+        const it = this.st.items[hit];
+        const [sx, sy] = this.toSource(e);
+        this.itemDrag = { dx: it.x - sx, dy: it.y - sy, moved: false };
+        const t = it.t === 'cover' ? 'cover' : it.t;
+        if (this.tool !== t) this.tool = t;
+        this.renderPanel();
+        this.requestPaint();
+        return;
+      }
+      if (ITEM_TOOLS.includes(this.tool)) {
+        const at = this.toSource(e);
+        if (this.selItem >= 0) {
+          // 고른 것이 있으면 먼저 선택만 해제
+          this.selItem = -1;
+          this.renderPanel();
+          this.requestPaint();
+          return;
+        }
+        if (this.tool === 'text') this.addText(at);
+        else if (this.tool === 'sticker') this.addItem({ t: 'sticker', x: at[0], y: at[1], s: this.viewSize(0.12), emoji: this.sticker });
+        else if (this.tool === 'date') this.addItem({ t: 'date', x: at[0], y: at[1], s: this.viewSize(0.05), text: this.dateText() });
+        else if (this.tool === 'cover') {
+          const r = this.viewSize(0.09);
+          this.addItem({ t: 'cover', x: at[0], y: at[1], s: r, rx: r, ry: r * 1.15, mode: this.coverMode, emoji: '😊' });
+        }
+        return;
+      }
       this.cur = {
         tool: this.tool,
         color: this.color,
@@ -1818,6 +2059,17 @@ export class Editor {
         if (cx === undefined || Math.hypot(nx * this.Ww - cx, ny * this.Hw - cy) >= r * 0.7) this.healAt(nx, ny);
         return;
       }
+      if (this.itemDrag) {
+        const [sx, sy] = this.toSource(e);
+        const it = this.st.items[this.selItem];
+        if (it) {
+          it.x = Math.round((sx + this.itemDrag.dx) * 1e5) / 1e5;
+          it.y = Math.round((sy + this.itemDrag.dy) * 1e5) / 1e5;
+          this.itemDrag.moved = true;
+          this.requestPaint();
+        }
+        return;
+      }
       if (!this.cur) return;
       const [x, y] = this.toSource(e);
       const p = this.cur.pts;
@@ -1826,6 +2078,11 @@ export class Editor {
       this.requestPaint();
     });
     const end = (e) => {
+      if (this.itemDrag) {
+        if (this.itemDrag.moved) this.commit();
+        this.itemDrag = null;
+        return;
+      }
       if (this.op) {
         this.endOp();
         if (e.pointerType !== 'mouse') this.ringEl.hidden = true;
@@ -1974,6 +2231,264 @@ export class Editor {
     this.renderPanel();
   }
 
+  /* ---------- 원클릭 인생샷 · AI 화질 개선 ---------- */
+
+  async waitIdle(keys) {
+    for (let i = 0; i < 900 && keys.some((k) => this[k] === 'busy'); i++) await new Promise((r) => setTimeout(r, 100));
+  }
+
+  /** 자동 보정 + 자동 뷰티(얼굴이 있으면) + 배경 살짝 흐림(인물 사진이면) */
+  async oneShot() {
+    const st = this.st;
+    if (this.oneShotPrev) {
+      this.st = JSON.parse(this.oneShotPrev);
+      this.oneShotPrev = null;
+      this.commit();
+      this.renderPanel();
+      this.invalidate();
+      return;
+    }
+    const prev = JSON.stringify(st);
+    this.setBusy('인생샷 만드는 중…');
+    try {
+      if (!st.enhance.on) this.toggleEnhance();
+      if (this.renderer.gpu) {
+        if (this.faceState === 'idle') this.ensureFaces();
+        await this.waitIdle(['faceState']);
+        const faces = this.faces || [];
+        if (faces.length) {
+          for (const a of dv.ADJ) if (a.g === 'beauty' && AUTO_GROUPS.includes(a.bg)) st.adj[a.key] = a.face || ['skinSmooth', 'skinTone'].includes(a.key) ? AUTO_BEAUTY[a.key] || 0 : st.adj[a.key];
+          st.faceAdj = {};
+          // 얼굴이 사진에서 충분히 크면 인물 사진 → 배경을 살짝 흐리게
+          const big = faces.some((f) => Math.max(...f.map((p) => p[1])) - Math.min(...f.map((p) => p[1])) > 0.12);
+          if (big && faces.length <= 3) {
+            if (this.segState === 'idle') this.ensureSeg();
+            await this.waitIdle(['segState']);
+            if (this.person) st.adj.bgBlur = 30;
+          }
+        }
+      }
+      this.oneShotPrev = prev;
+      this.commit();
+      toast('인생샷 완성! 비교 버튼으로 전후를 확인해 보세요');
+    } catch (err) {
+      console.error(err);
+    }
+    this.setBusy('');
+    this.renderPanel();
+    this.invalidate();
+  }
+
+  /** 지금 보정을 원본 해상도로 적용한 결과 캔버스 */
+  async renderOutput() {
+    await this.waitDetect();
+    const src = await decode(this.blob);
+    const [W, H] = dimsOf(src);
+    let source = src;
+    if (this.st.heals.length) {
+      source = im.makeCanvas(W, H);
+      source.getContext('2d', { willReadFrequently: true }).drawImage(src, 0, 0);
+      dv.applyHeals(source, this.st.heals, 900);
+    }
+    const out = renderFinal(this.renderer, source, W, H, this.st);
+    src.close?.();
+    this.renderer.setSource(this.work, this.Ww, this.Hw);
+    this.baseDirty = true;
+    return out;
+  }
+
+  /** AI로 2배 키우기 (지금 보정까지 적용해 사본으로 저장) */
+  async aiUpscale() {
+    const src = await decode(this.blob);
+    const [W, H] = dimsOf(src);
+    src.close?.();
+    if (W * H > 2_100_000) {
+      toast(`이미 충분히 큰 사진이에요 (${Math.round((W * H) / 1e4)}만 화소) · 200만 화소 이하의 작은 사진에서 쓸 수 있어요`, { duration: 4000 });
+      return;
+    }
+    const ok = await confirmDialog({ title: 'AI 화질 개선', message: `지금 보정을 적용한 뒤 AI로 2배(${W * 2}×${H * 2})로 키우고 선명하게 해서 사본으로 저장해요. 처음 한 번 약 2MB를 내려받고, 사진 크기에 따라 몇십 초 걸릴 수 있어요.`, ok: '시작' });
+    if (!ok) return;
+    this.setBusy('화질 개선 준비 중…');
+    await new Promise((r) => setTimeout(r, 30));
+    try {
+      const out = await this.renderOutput();
+      const big = await upscale2x(out, (p) => this.setBusy(`AI 화질 개선 중… ${Math.round(p * 100)}%`));
+      const blob = await im.canvasToBlob(big, this.type === 'image/png' ? 'image/png' : 'image/jpeg');
+      await this.onSave(blob, true, null);
+    } catch (err) {
+      console.error(err);
+      this.setBusy('');
+      toast(`화질 개선을 하지 못했어요: ${err.message}`);
+    }
+  }
+
+  /* ---------- 꾸미기 ---------- */
+
+  decoPanel() {
+    const st = this.st;
+    const tool = this.tool;
+    const it = st.items[this.selItem];
+    const tools = `<div class="ed-chips">${TOOLS.map(([k, ic, label]) => `<button type="button" class="ed-chip${tool === k ? ' on' : ''}" data-tool="${k}">${icon(ic)}${label}</button>`).join('')}</div>`;
+    const sizeRow = (v) => this.sliderRow({ attrs: 'data-slider="itemSize"', label: '크기', value: v, min: 5, max: 100, text: `${v}`, reset: false });
+    const itemBar = it ? `<div class="ed-chips"><button type="button" class="ed-chip" data-act="item-delete">${icon('trash')}지우기</button>${it.t === 'text' ? `<button type="button" class="ed-chip" data-act="item-edit">${icon('edit')}글자 고치기</button>` : ''}<button type="button" class="ed-chip" data-act="item-done">${icon('check')}선택 해제</button></div>` : '';
+    const sizeOf = (x) => Math.round(Math.sqrt((x.t === 'cover' ? (x.rx || x.s) : x.s) / 0.3) * 100);
+    if (tool === 'text') {
+      const cur = it?.t === 'text' ? it : null;
+      return `${tools}
+        ${cur ? `${sizeRow(sizeOf(cur))}
+        <div class="ed-colors">${TEXT_COLORS.map((c) => `<button type="button" class="ed-color${c === cur.color ? ' on' : ''}" data-item-color="${c}" style="--c:${c}" aria-label="색 ${c}"></button>`).join('')}</div>
+        <div class="ed-chips">${TEXT_FONTS.map(([k, l]) => `<button type="button" class="ed-chip${cur.font === k ? ' on' : ''}" data-item-font="${k}">${l}</button>`).join('')}${TEXT_STYLES.map(([k, l]) => `<button type="button" class="ed-chip${(cur.style || 'plain') === k ? ' on' : ''}" data-item-style="${k}">${l}</button>`).join('')}</div>
+        ${itemBar}` : `<div class="ed-chips"><button type="button" class="ed-chip ed-auto" data-act="add-text">${icon('add')}글자 넣기</button></div>`}
+        <p class="ed-hint">${cur ? '글자를 끌어서 옮기고, 크기·색·글꼴을 바꿔 보세요.' : '‘글자 넣기’를 누르거나 사진을 눌러 그 자리에 글자를 넣어요.'}</p>`;
+    }
+    if (tool === 'sticker') {
+      const cur = it?.t === 'sticker' ? it : null;
+      return `${tools}
+        ${cur ? `${sizeRow(sizeOf(cur))}${itemBar}` : ''}
+        <div class="ed-stickers">${STICKERS.map((e) => `<button type="button" class="ed-stk${this.sticker === e ? ' on' : ''}" data-sticker="${e}">${e}</button>`).join('')}</div>
+        <p class="ed-hint">스티커를 누르면 사진 가운데에 붙어요. 끌어서 옮기고 크기를 바꿀 수 있어요.</p>`;
+    }
+    if (tool === 'date') {
+      const has = st.items.some((x) => x.t === 'date');
+      const cur = it?.t === 'date' ? it : null;
+      return `${tools}
+        <div class="ed-chips"><button type="button" class="ed-chip${has ? ' on' : ''}" data-act="toggle-date">${icon('event')}${has ? '날짜 빼기' : '찍은 날짜 넣기'}</button></div>
+        ${cur ? `${sizeRow(sizeOf(cur))}${itemBar}` : ''}
+        <p class="ed-hint">필름 카메라처럼 오른쪽 아래에 주황색 날짜를 새겨요 (${esc(this.dateText())}). 끌어서 옮길 수 있어요.</p>`;
+    }
+    if (tool === 'cover') {
+      const cur = it?.t === 'cover' ? it : null;
+      return `${tools}
+        <div class="ed-chips">
+          <button type="button" class="ed-chip ed-auto" data-act="cover-faces"${this.renderer?.gpu === false ? ' disabled' : ''}>${icon('face')}얼굴 자동 가리기</button>
+          ${COVER_MODES.map(([k, l]) => `<button type="button" class="ed-chip${(cur ? cur.mode : this.coverMode) === k ? ' on' : ''}" data-cover-mode="${k}">${l}</button>`).join('')}
+        </div>
+        ${cur ? `${sizeRow(sizeOf(cur))}${itemBar}` : ''}
+        <p class="ed-hint">얼굴을 찾아 한 번에 가려요. 사진을 누르면 그 자리를 가리고, 가린 곳을 눌러 옮기거나 지울 수 있어요.</p>`;
+    }
+    if (tool === 'frame') {
+      const f = st.frame;
+      return `${tools}
+        <div class="ed-chips">${FRAME_ASPECTS.map(([k, l]) => `<button type="button" class="ed-chip${f.aspect === k ? ' on' : ''}" data-frame-aspect="${k}">${l}</button>`).join('')}</div>
+        <div class="ed-chips">${[['white', '흰 여백'], ['black', '검은 여백'], ['blur', '흐린 사진']].map(([k, l]) => `<button type="button" class="ed-chip${f.fill === k ? ' on' : ''}" data-frame-fill="${k}">${l}</button>`).join('')}</div>
+        ${this.sliderRow({ attrs: 'data-slider="framePad"', label: '테두리', value: f.pad, min: 0, max: 20, text: `${f.pad}%`, reset: false })}
+        <p class="ed-hint">사진을 자르지 않고 여백을 채워 인스타그램(4:5 · 1:1)이나 스토리(9:16) 비율로 맞춰요. 테두리를 올리면 폴라로이드처럼 돼요.</p>`;
+    }
+    return `${tools}
+      <div class="ed-chips">
+        <button type="button" class="ed-chip" data-act="undo-stroke"${st.strokes.length ? '' : ' disabled'}>${icon('undo')}한 획 지우기</button>
+        <button type="button" class="ed-chip" data-act="clear-strokes"${st.strokes.length ? '' : ' disabled'}>${icon('trash')}모두 지우기</button>
+      </div>
+      <div class="ed-colors"${tool === 'mosaic' ? ' hidden' : ''}>${COLORS.map((c) => `<button type="button" class="ed-color${c === this.color ? ' on' : ''}" data-color="${c}" style="--c:${c}" aria-label="색 ${c}"></button>`).join('')}</div>
+      ${this.sliderRow({ attrs: 'data-slider="size"', label: '굵기', value: this.sizes[tool], min: 1, max: 40, text: `${this.sizes[tool]}`, reset: false })}
+      <p class="ed-hint">${tool === 'mosaic' ? '가리고 싶은 부분(얼굴, 번호판, 개인정보)을 문질러 주세요' : '사진 위에 손가락이나 마우스로 그려 보세요 (두 손가락으로 확대)'}</p>`;
+  }
+
+  /** 여백 미리보기 (흰색 · 검정 · 흐린 사진) */
+  drawFramePreview() {
+    const fr = this.view?.frame;
+    if (!fr || !this.glCanvas) return;
+    const f = this.st.frame;
+    const el = this.frameEl;
+    const k = 48 / Math.max(fr[0], fr[1]);
+    const w = Math.max(2, Math.round(fr[0] * k));
+    const h = Math.max(2, Math.round(fr[1] * k));
+    if (el.width !== w) el.width = w;
+    if (el.height !== h) el.height = h;
+    const ctx = el.getContext('2d');
+    if (f.fill === 'blur') {
+      const s = Math.max(w / this.glCanvas.width, h / this.glCanvas.height);
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(this.glCanvas, (w - this.glCanvas.width * s) / 2, (h - this.glCanvas.height * s) / 2, this.glCanvas.width * s, this.glCanvas.height * s);
+      ctx.fillStyle = 'rgba(0,0,0,0.12)';
+      ctx.fillRect(0, 0, w, h);
+    } else {
+      ctx.fillStyle = f.fill === 'black' ? '#000' : '#fff';
+      ctx.fillRect(0, 0, w, h);
+    }
+  }
+
+  dateText() {
+    const d = new Date(this.takenAt);
+    const p2 = (v) => String(v).padStart(2, '0');
+    return `'${p2(d.getFullYear() % 100)} ${p2(d.getMonth() + 1)} ${p2(d.getDate())}`;
+  }
+
+  /** 지금 화면 가운데의 원본 좌표 */
+  viewCenter() {
+    const r = this.canvas.getBoundingClientRect();
+    const sr = this.stage.getBoundingClientRect();
+    const cx = Math.min(Math.max(sr.left + sr.width / 2, r.left), r.right);
+    const cy = Math.min(Math.max(sr.top + sr.height / 2, r.top), r.bottom);
+    return this.toSource({ clientX: cx, clientY: cy });
+  }
+
+  /** 화면에서 보이는 크기(비율 0~1)를 원본 기준 크기로 */
+  viewSize(frac) {
+    return this.visibleToSource(frac * 400) / Math.max(this.Ww, this.Hw);
+  }
+
+  addItem(item) {
+    this.st.items.push(item);
+    this.selItem = this.st.items.length - 1;
+    this.commit();
+    this.renderPanel();
+    this.requestPaint();
+  }
+
+  async addText(at) {
+    const text = await promptDialog({ title: '글자 넣기', placeholder: '넣을 글자를 입력하세요', ok: '넣기' });
+    if (!text) return;
+    const [x, y] = at || this.viewCenter();
+    this.addItem({ t: 'text', x, y, s: this.viewSize(0.07), text: String(text).slice(0, 80), color: '#ffffff', font: 'sans', style: 'plain' });
+  }
+
+  async coverFaces() {
+    this.setBusy('얼굴을 찾는 중…');
+    try {
+      if (this.faceState === 'idle') await this.ensureFaces();
+      while (this.faceState === 'busy') await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      this.setBusy('');
+    }
+    const faces = this.faces || [];
+    if (!faces.length) {
+      toast('얼굴을 찾지 못했어요 · 사진을 눌러 직접 가릴 수 있어요');
+      return;
+    }
+    const M = Math.max(this.Ww, this.Hw);
+    for (const f of faces) {
+      const xs = f.map((p) => p[0]);
+      const ys = f.map((p) => p[1]);
+      const x0 = Math.min(...xs);
+      const x1 = Math.max(...xs);
+      const y0 = Math.min(...ys);
+      const y1 = Math.max(...ys);
+      const rx = (((x1 - x0) * this.Ww) / M) * 0.62;
+      const ry = (((y1 - y0) * this.Hw) / M) * 0.68;
+      this.st.items.push({ t: 'cover', x: (x0 + x1) / 2, y: (y0 + y1) / 2 - (y1 - y0) * 0.04, s: Math.max(rx, ry), rx, ry, mode: this.coverMode, emoji: '😊' });
+    }
+    this.selItem = -1;
+    this.commit();
+    this.renderPanel();
+    this.requestPaint();
+    toast(`얼굴 ${faces.length}개를 가렸어요`);
+  }
+
+  /** 화면 좌표에서 고를 수 있는 꾸미기 항목 */
+  hitItem(e) {
+    if (!this.itemBoxes?.length) return -1;
+    const r = this.canvas.getBoundingClientRect();
+    const x = ((e.clientX - r.left) * this.canvas.width) / r.width;
+    const y = ((e.clientY - r.top) * this.canvas.height) / r.height;
+    const pad = 10 * (this.canvas.width / r.width);
+    for (let k = this.itemBoxes.length - 1; k >= 0; k--) {
+      const b = this.itemBoxes[k];
+      if (x >= b.x0 - pad && x <= b.x1 + pad && y >= b.y0 - pad && y <= b.y1 + pad) return b.i;
+    }
+    return -1;
+  }
+
   /** 프리셋·복사한 보정 적용 (사진마다 다른 자르기·지우기 등은 그대로) */
   useStyle(style, msg) {
     looks.applyStyle(this.st, style);
@@ -1981,6 +2496,7 @@ export class Editor {
     if (need.faces) this.ensureFaces();
     if (need.poses) this.ensurePose();
     if (need.person) this.ensureSeg();
+    if (need.sky) this.ensureSky();
     this.faceSel = -1;
     this.commit();
     this.renderPanel();

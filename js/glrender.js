@@ -2,7 +2,8 @@
 // WebGL2를 쓸 수 없는 오래된 기기에서는 기존(CPU) 방식으로 기본 보정만 적용합니다.
 import * as dv from './develop.js';
 import * as im from './imaging.js';
-import { buildWarps, buildMasks, legMap, LIP_COLORS, BLUSH_COLORS, SHADOW_COLORS, detectFaces, detectPoses, segmentPerson } from './face.js';
+import { buildWarps, buildMasks, legMap, LIP_COLORS, BLUSH_COLORS, SHADOW_COLORS, HAIR_COLORS, CLOTH_COLORS, detectFaces, detectPoses, segmentPerson } from './face.js';
+import { SKIES, detectSky } from './sky.js';
 import { WarpField, LocalMask, OpCache } from './retouch.js';
 
 /* ---------- 셰이더 ---------- */
@@ -176,8 +177,12 @@ uniform sampler2D uPM; // 사람 영역
 uniform sampler2D uBGB; // 흐린 배경 (사람 색 뺀 것)
 uniform vec4 uFP[18]; // 얼굴마다 3개: (피부, 화사, 다크서클, 볼) (입술, 치아, 눈, 눈썹) (립, 블러셔, 섀도, -)
 uniform vec3 uLipC, uBlushC, uShadowC;
-uniform int uHasPM, uHasBGB;
+uniform int uHasPM, uHasBGB, uHasSK;
 uniform float uBgLight, uBgMono;
+uniform sampler2D uSK; // 하늘 영역
+uniform vec3 uHairC, uClothC, uSkyTop, uSkyHor, uSkyTint;
+uniform float uHairAmt, uClothAmt, uShade, uWarm, uSkyAmt, uSkyCloud, uSkyStars, uLeak, uDust;
+
 uniform sampler2D uLut;
 uniform vec2 uOut;
 uniform vec3 uWB;
@@ -223,6 +228,16 @@ float vnoise(vec2 p) {
   return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
 }
 const float HC[9] = float[9](0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0, 360.0);
+float fbm(vec2 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { v += a * vnoise(p); p = p * 2.03 + 17.1; a *= 0.5; }
+  return v;
+}
+// 고른 색으로 바꾸되 원래의 명암(결·주름·머리카락 결)은 그대로
+vec3 recolor(vec3 c, vec3 t) {
+  float L = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  return clamp(t * clamp(0.3 + 1.4 * L, 0.0, 2.0), 0.0, 1.0);
+}
 
 void main() {
   vec2 uv = gl_FragCoord.xy / uOut;
@@ -238,6 +253,29 @@ void main() {
     float k = (1.0 - person) * smoothstep(0.0, 0.15, bb.a);
     c = mix(c, bg, k);
     sharpK = 1.0 - k;
+  }
+  // 하늘 바꾸기 (그라데이션 + 구름/별, 해상도와 관계없이 같은 모양)
+  float skyM = 0.0;
+  if (uHasSK == 1) {
+    skyM = texture(uSK, uv).r * uSkyAmt;
+    vec2 asp = vec2(uOut.x / max(uOut.x, uOut.y), uOut.y / max(uOut.x, uOut.y));
+    float t = clamp((uv.y - 0.25) / 0.75, 0.0, 1.0);
+    vec3 sky = mix(uSkyHor, uSkyTop, smoothstep(0.0, 1.0, t));
+    if (uSkyCloud > 0.0) {
+      vec2 q = uv * asp * vec2(2.2, 4.0) + vec2(3.7, 1.3);
+      float n = fbm(q) * 0.75 + fbm(q * 2.7 + 5.0) * 0.25;
+      float cl = smoothstep(0.52, 0.78, n) * uSkyCloud * (0.4 + 0.6 * t);
+      sky = mix(sky, mix(vec3(1.0), uSkyHor, 0.25) * (0.92 + 0.12 * n), cl);
+    }
+    if (uSkyStars > 0.0) {
+      vec2 g = uv * asp * 260.0;
+      float h = hash(floor(g));
+      float st = step(0.992, h) * (1.0 - length(fract(g) - 0.5) * 2.2);
+      sky += vec3(max(st, 0.0)) * uSkyStars * (0.5 + h * 0.5) * t;
+    }
+    c = mix(c, sky, skyM);
+    sharpK *= 1.0 - skyM;
+    c *= mix(vec3(1.0), uSkyTint, (1.0 - texture(uSK, uv).r) * uSkyAmt * 0.6);
   }
 
   // 작은 디테일 (텍스처 · 선명하게)
@@ -350,6 +388,17 @@ void main() {
     c = mix(c, c * (uShadowC / lumaS(uShadowC)) * 0.88, k2.b * F2.z * 0.55);
     // 눈썹 진하게: 결을 살린 채 어둡게
     c = mix(c, c * 0.68, k2.a * F1.w * 0.75);
+  }
+
+  // 머리색 · 옷 색 · 피부 톤 (사람 영역의 부위 지도)
+  if (uHasPM == 1) {
+    vec4 pm = texture(uPM, uv);
+    if (uHairAmt > 0.0) c = mix(c, recolor(c, uHairC), pm.g * uHairAmt * 0.85);
+    if (uClothAmt > 0.0) c = mix(c, recolor(c, uClothC), pm.b * uClothAmt * 0.9);
+    float sm = pm.a * (1.0 - er);
+    if (uShade > 0.0) c = mix(c, mix(vec3(luma(c)), c + (1.0 - c) * vec3(0.16, 0.14, 0.13), 0.92), sm * uShade);
+    else if (uShade < 0.0) c = mix(c, c * vec3(0.84, 0.72, 0.6), sm * -uShade);
+    if (uWarm != 0.0) c += c * (uWarm > 0.0 ? vec3(0.03, 0.01, -0.07) : vec3(0.03, -0.045, 0.0)) * abs(uWarm) * sm;
   }
 
   // 화이트밸런스 · 노출 (빛의 세기 그대로인 선형 공간에서)
@@ -471,6 +520,29 @@ void main() {
     float bgm = 1.0 - person;
     if (uBgLight != 0.0) c = mix(c, uBgLight > 0.0 ? c + (1.0 - c) * uBgLight * 0.45 : c * (1.0 + uBgLight * 0.55), bgm);
     c = mix(c, vec3(luma(c)), bgm * uBgMono);
+  }
+
+  // 필름 효과: 빛 번짐(가장자리의 따뜻한 빛) · 먼지와 긁힘
+  if (uLeak > 0.0) {
+    vec2 q = uv;
+    float g1 = exp(-dot((q - vec2(-0.08, 0.72)) * vec2(1.0, 0.7), (q - vec2(-0.08, 0.72)) * vec2(1.0, 0.7)) / 0.09);
+    float g2 = exp(-dot(q - vec2(1.06, 0.12), q - vec2(1.06, 0.12)) / 0.06);
+    vec3 leak = vec3(1.0, 0.46, 0.14) * g1 + vec3(1.0, 0.28, 0.38) * g2 * 0.8;
+    c = 1.0 - (1.0 - c) * (1.0 - clamp(leak * uLeak * 0.9, 0.0, 1.0));
+  }
+  if (uDust > 0.0) {
+    vec2 asp = vec2(uOut.x / max(uOut.x, uOut.y), uOut.y / max(uOut.x, uOut.y));
+    vec2 g = uv * asp * 90.0;
+    float h = hash(floor(g) + 11.3);
+    vec2 f = fract(g) - vec2(hash(floor(g) + 2.1), hash(floor(g) + 5.7));
+    float speck = step(0.975, h) * smoothstep(0.06, 0.0, length(f) - 0.02 * h);
+    // 긁힘: 드문드문, 길이와 위치가 제각각인 가는 세로줄
+    float colx = uv.x * 900.0;
+    float hc = hash(vec2(floor(colx), 3.0));
+    float seg = smoothstep(0.62, 0.7, vnoise(vec2(floor(colx) * 1.7, uv.y * 3.0 + hc * 40.0)));
+    float line = step(0.9993, hc) * smoothstep(0.5, 0.1, abs(fract(colx) - 0.5)) * seg;
+    float dark = step(0.5, hash(floor(g) + 9.9));
+    c = mix(c, dark > 0.5 ? c * 0.35 : vec3(0.95), clamp(speck * uDust * 0.9 + line * uDust * 0.3, 0.0, 1.0));
   }
 
   // 칠한 영역 보기
@@ -690,7 +762,7 @@ export class GLRenderer {
     let MK1 = null;
     let MK2 = null;
     let MK3 = null;
-    if (faces && beauty) {
+    if (faces && beauty && !this.liveFaces) {
       this.ensureMasks();
       MK1 = this.target('MK1', outW, outH, false);
       this.pass(this.prog.geo, MK1, outW, outH, geoTex(this.mk1Tex), geoSet);
@@ -701,7 +773,7 @@ export class GLRenderer {
     }
     // 사람 영역 (배경 흐림 · 밝기 · 흑백)
     let PM = null;
-    if (this.person && (a.bgBlur > 0 || a.bgLight || a.bgMono > 0)) {
+    if (this.person && (a.bgBlur > 0 || a.bgLight || a.bgMono > 0 || a.hairAmt > 0 || a.clothAmt > 0 || a.skinShade || a.skinWarm)) {
       this.ensurePerson();
       PM = this.target('PM', outW, outH, false);
       this.pass(this.prog.geo, PM, outW, outH, geoTex(this.pmTex), geoSet);
@@ -728,6 +800,14 @@ export class GLRenderer {
     }
     gl.bindTexture(gl.TEXTURE_2D, A.tex);
     gl.generateMipmap(gl.TEXTURE_2D);
+
+    // 하늘 영역
+    let SK = null;
+    if (this.sky && a.skyAmt > 0) {
+      this.ensureSky();
+      SK = this.target('SK', outW, outH, false);
+      this.pass(this.prog.geo, SK, outW, outH, geoTex(this.skTex), geoSet);
+    }
 
     // 1-2) 배경 흐림: 사람 색을 뺀 배경만 1/4 크기에서 흐림 (사진 크기 기준이라 미리보기와 저장 결과가 같음)
     let BGB = null;
@@ -794,7 +874,7 @@ export class GLRenderer {
     const hasHsl = P.hsl.some((v) => v.some((x) => x));
     const wb = dv.wbGains(a.temp, a.tint);
     this.pass(this.prog.develop, null, outW, outH, {
-      uImg: A.tex, uBL: BL.tex, uBM: BM.tex, uSB: SB ? SB.tex : this.dummy, uNC: NC ? NC.tex : this.dummy, uMK1: MK1 ? MK1.tex : this.dummy, uMK2: MK2 ? MK2.tex : this.dummy, uLM: LM ? LM.tex : this.dummy, uER: ER ? ER.tex : this.dummy, uMK3: MK3 ? MK3.tex : this.dummy, uPM: PM ? PM.tex : this.dummy, uBGB: BGB ? BGB.tex : this.dummy, uLut: this.lutTex,
+      uImg: A.tex, uBL: BL.tex, uBM: BM.tex, uSB: SB ? SB.tex : this.dummy, uNC: NC ? NC.tex : this.dummy, uMK1: MK1 ? MK1.tex : this.dummy, uMK2: MK2 ? MK2.tex : this.dummy, uLM: LM ? LM.tex : this.dummy, uER: ER ? ER.tex : this.dummy, uMK3: MK3 ? MK3.tex : this.dummy, uPM: PM ? PM.tex : this.dummy, uBGB: BGB ? BGB.tex : this.dummy, uSK: SK ? SK.tex : this.dummy, uLut: this.lutTex,
     }, (p) => {
       const f = (n, v) => gl.uniform1f(p.u(n), v);
       gl.uniform3f(p.u('uWB'), ...wb);
@@ -833,6 +913,24 @@ export class GLRenderer {
       gl.uniform1i(p.u('uHasBGB'), BGB ? 1 : 0);
       f('uBgLight', a.bgLight / 100);
       f('uBgMono', a.bgMono / 100);
+      const pick = (list, id) => (list.find((x) => x[0] === id) || list[0])[2];
+      const mk0 = st.makeup || {};
+      gl.uniform3f(p.u('uHairC'), ...pick(HAIR_COLORS, mk0.hair));
+      gl.uniform3f(p.u('uClothC'), ...pick(CLOTH_COLORS, mk0.cloth));
+      f('uHairAmt', (a.hairAmt || 0) / 100);
+      f('uClothAmt', (a.clothAmt || 0) / 100);
+      f('uShade', (a.skinShade || 0) / 100);
+      f('uWarm', (a.skinWarm || 0) / 100);
+      gl.uniform1i(p.u('uHasSK'), SK ? 1 : 0);
+      const sky = pick(SKIES, st.sky);
+      gl.uniform3f(p.u('uSkyTop'), ...sky.top);
+      gl.uniform3f(p.u('uSkyHor'), ...sky.hor);
+      gl.uniform3f(p.u('uSkyTint'), ...sky.tint);
+      f('uSkyAmt', (a.skyAmt || 0) / 100);
+      f('uSkyCloud', sky.cloud);
+      f('uSkyStars', sky.stars);
+      f('uLeak', (a.leak || 0) / 100);
+      f('uDust', (a.dust || 0) / 100);
       // 얼굴별 값
       const fp = new Float32Array(18 * 4);
       facesAdj.slice(0, 6).forEach((fa, i) => {
@@ -977,13 +1075,16 @@ export class GLRenderer {
   ensurePerson() {
     if (this.pmKey === this.person) return;
     const gl = this.gl;
-    const { w, h, data } = this.person;
+    const { w, h, person, hair, clothes, skin } = this.person;
     if (this.pmTex) gl.deleteTexture(this.pmTex);
     this.pmTex = this.texture(w, h, false);
+    // R 사람 · G 머리카락 · B 옷 · A 피부
     const rgba = new Uint8Array(w * h * 4);
     for (let i = 0; i < w * h; i++) {
-      rgba[i * 4] = data[i];
-      rgba[i * 4 + 3] = 255;
+      rgba[i * 4] = person[i];
+      rgba[i * 4 + 1] = hair ? hair[i] : 0;
+      rgba[i * 4 + 2] = clothes ? clothes[i] : 0;
+      rgba[i * 4 + 3] = skin ? skin[i] : 0;
     }
     gl.bindTexture(gl.TEXTURE_2D, this.pmTex);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -991,9 +1092,33 @@ export class GLRenderer {
     this.pmKey = this.person;
   }
 
+  /** 하늘 영역 { w, h, data } */
+  setSky(sky) {
+    this.sky = sky || null;
+    this.skKey = null;
+  }
+
+  ensureSky() {
+    if (this.skKey === this.sky) return;
+    const gl = this.gl;
+    const { w, h, data } = this.sky;
+    if (this.skTex) gl.deleteTexture(this.skTex);
+    this.skTex = this.texture(w, h, false);
+    const rgba = new Uint8Array(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      rgba[i * 4] = data[i];
+      rgba[i * 4 + 3] = 255;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.skTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    this.skKey = this.sky;
+  }
+
   /** 얼굴 인식 결과(비율 좌표)를 알려 줍니다. null이면 얼굴 없음 */
-  setFaces(faces) {
+  setFaces(faces, live = false) {
     this.faces = faces && faces.length ? faces : null;
+    this.liveFaces = live; // 카메라 화면: 매 장면 바뀌므로 부위 영역은 만들지 않고 얼굴형만 (빠르게)
     this.maskKey = null;
   }
 
@@ -1071,6 +1196,8 @@ class CPURenderer {
   setPoses() {}
 
   setPerson() {}
+
+  setSky() {}
 
   warpPoint(nx, ny) {
     return [nx, ny];
@@ -1185,9 +1312,10 @@ export function renderFinal(renderer, src, W, H, st, maxPixels = 16_000_000) {
   const ctx = out.getContext('2d');
   ctx.drawImage(canvas, 0, 0);
   drawStrokes(ctx, canvas, st.strokes, matrix, W, H);
+  drawItems(ctx, canvas, st.items, matrix, W, H);
   renderer.trim();
   renderer.showLocal = show;
-  return out;
+  return composeFrame(out, st.frame);
 }
 
 /**
@@ -1207,13 +1335,16 @@ export async function styleBlob(blob, type, st, need = {}) {
       small.getContext('2d').drawImage(src, 0, 0, small.width, small.height);
       r.setFaces(need.faces ? await detectFaces(small).catch(() => null) : null);
       r.setPoses(need.poses ? await detectPoses(small).catch(() => null) : null);
-      r.setPerson(need.person ? await segmentPerson(small, small.width, small.height).catch(() => null) : null);
+      const person = need.person ? await segmentPerson(small, small.width, small.height).catch(() => null) : null;
+      r.setPerson(person);
+      r.setSky(need.sky ? detectSky(small, small.width, small.height, person) : null);
     }
     return await im.canvasToBlob(renderFinal(r, src, W, H, st), type);
   } finally {
     r.setFaces(null);
     r.setPoses(null);
     r.setPerson(null);
+    r.setSky(null);
     src.close?.();
   }
 }
@@ -1244,5 +1375,189 @@ export function previewEnhance(source, opts) {
   const { canvas } = r.render(st, { region: dv.FULL, outW: W * k, outH: H * k, outScale: k });
   const out = im.makeCanvas(canvas.width, canvas.height);
   out.getContext('2d').drawImage(canvas, 0, 0);
+  return out;
+}
+
+/* ---------- 꾸미기: 글자 · 스티커 · 날짜 · 얼굴 가리기 ---------- */
+
+export const FONTS = {
+  sans: '800 {s}px "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif',
+  serif: '700 {s}px "AppleMyungjo", "Noto Serif KR", "Batang", serif',
+  hand: '600 {s}px "Nanum Pen Script", "Gaegu", "Comic Sans MS", cursive',
+  round: '800 {s}px "Jua", "BM JUA", "Arial Rounded MT Bold", system-ui, sans-serif',
+};
+
+const isDark = (hex) => {
+  const v = parseInt(hex.slice(1), 16);
+  return 0.2126 * (v >> 16) + 0.7152 * ((v >> 8) & 255) + 0.0722 * (v & 255) < 110;
+};
+
+/** 가리기 영역(타원) 안쪽을 모자이크 · 흐리게 */
+function coverRegion(ctx, base, cx, cy, rx, ry, mode) {
+  const x0 = Math.max(0, Math.floor(cx - rx));
+  const y0 = Math.max(0, Math.floor(cy - ry));
+  const x1 = Math.min(ctx.canvas.width, Math.ceil(cx + rx));
+  const y1 = Math.min(ctx.canvas.height, Math.ceil(cy + ry));
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w < 2 || h < 2) return;
+  const cell = mode === 'mosaic' ? Math.max(5, Math.round(Math.max(rx, ry) / 6)) : Math.max(3, Math.round(Math.max(rx, ry) / 9));
+  const sw = Math.max(1, Math.round(w / cell));
+  const sh = Math.max(1, Math.round(h / cell));
+  const small = im.makeCanvas(sw, sh);
+  const sc = small.getContext('2d');
+  sc.imageSmoothingQuality = 'high';
+  sc.drawImage(base, x0, y0, w, h, 0, 0, sw, sh);
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.imageSmoothingEnabled = mode !== 'mosaic';
+  if (mode === 'blur') {
+    // 두 번 키워 더 부드럽게
+    const mid = im.makeCanvas(Math.max(1, sw * 3), Math.max(1, sh * 3));
+    const mc = mid.getContext('2d');
+    mc.imageSmoothingQuality = 'high';
+    mc.drawImage(small, 0, 0, mid.width, mid.height);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(mid, x0, y0, w, h);
+  } else ctx.drawImage(small, x0, y0, w, h);
+  ctx.restore();
+}
+
+/**
+ * 글자 · 스티커 · 날짜 · 얼굴 가리기를 그립니다 (원근·자르기까지 반영해 자리를 옮김).
+ * @returns {Array<{i:number, x0:number, y0:number, x1:number, y1:number}>} 화면에서의 범위 (고르기용)
+ */
+export function drawItems(ctx, base, items, M, W, H) {
+  const boxes = [];
+  if (!items?.length) return boxes;
+  const unit = Math.max(W, H);
+  items.forEach((it, i) => {
+    const [px, py] = dv.mapPoint(M, it.x * W, it.y * H);
+    const k = dv.matrixScale(M, it.x * W, it.y * H);
+    const size = it.s * unit * k;
+    ctx.save();
+    if (it.t === 'cover') {
+      const rx = (it.rx || it.s) * unit * k;
+      const ry = (it.ry || it.s) * unit * k;
+      if (it.mode === 'emoji') {
+        ctx.font = `${Math.round(Math.max(rx, ry) * 2.1)}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(it.emoji || '😊', px, py + Math.max(rx, ry) * 0.08);
+      } else coverRegion(ctx, base, px, py, rx, ry, it.mode || 'mosaic');
+      boxes.push({ i, x0: px - rx, y0: py - ry, x1: px + rx, y1: py + ry });
+    } else if (it.t === 'sticker') {
+      ctx.font = `${Math.round(size)}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(it.emoji, px, py);
+      boxes.push({ i, x0: px - size * 0.6, y0: py - size * 0.6, x1: px + size * 0.6, y1: py + size * 0.6 });
+    } else {
+      // 글자 · 날짜
+      const date = it.t === 'date';
+      const fs = Math.max(4, size);
+      ctx.font = date ? `700 ${Math.round(fs)}px "DS-Digital", "Courier New", ui-monospace, monospace` : (FONTS[it.font] || FONTS.sans).replace('{s}', Math.round(fs));
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const lines = String(it.text || '').split('\n');
+      const lh = fs * 1.2;
+      const widths = lines.map((l) => ctx.measureText(l).width);
+      const tw = Math.max(...widths, fs);
+      const th = lh * lines.length;
+      const top = py - th / 2 + lh / 2;
+      const color = date ? '#ff8a2a' : it.color || '#ffffff';
+      if (!date && it.style === 'box') {
+        const pad = fs * 0.35;
+        ctx.fillStyle = isDark(color) ? 'rgba(255,255,255,0.88)' : 'rgba(0,0,0,0.55)';
+        const r = fs * 0.3;
+        const bx = px - tw / 2 - pad;
+        const by = py - th / 2 - pad * 0.6;
+        const bw = tw + pad * 2;
+        const bh = th + pad * 1.2;
+        ctx.beginPath();
+        ctx.moveTo(bx + r, by);
+        ctx.arcTo(bx + bw, by, bx + bw, by + bh, r);
+        ctx.arcTo(bx + bw, by + bh, bx, by + bh, r);
+        ctx.arcTo(bx, by + bh, bx, by, r);
+        ctx.arcTo(bx, by, bx + bw, by, r);
+        ctx.fill();
+      }
+      lines.forEach((l, li) => {
+        const y = top + li * lh;
+        if (date) {
+          ctx.shadowColor = 'rgba(255,120,30,0.85)';
+          ctx.shadowBlur = fs * 0.35;
+        } else if (it.style === 'outline') {
+          ctx.lineJoin = 'round';
+          ctx.lineWidth = fs * 0.16;
+          ctx.strokeStyle = isDark(color) ? '#ffffff' : '#111111';
+          ctx.strokeText(l, px, y);
+        } else if (it.style !== 'box') {
+          ctx.shadowColor = 'rgba(0,0,0,0.45)';
+          ctx.shadowBlur = fs * 0.12;
+          ctx.shadowOffsetY = fs * 0.04;
+        }
+        ctx.fillStyle = color;
+        ctx.fillText(l, px, y);
+      });
+      boxes.push({ i, x0: px - tw / 2, y0: py - th / 2, x1: px + tw / 2, y1: py + th / 2 });
+    }
+    ctx.restore();
+  });
+  return boxes;
+}
+
+/* ---------- 비율 맞추기: 자르지 않고 여백을 채워 원하는 비율로 ---------- */
+
+export const FRAME_ASPECTS = [['none', '원본'], ['1:1', '1:1'], ['4:5', '4:5'], ['3:4', '3:4'], ['9:16', '9:16'], ['16:9', '16:9']];
+
+export const frameOn = (f) => !!f && (f.aspect !== 'none' || f.pad > 0);
+
+/** 여백을 더한 전체 크기 (사진 크기 w×h 기준) */
+export function frameDims(w, h, f) {
+  const m = ((f.pad || 0) / 100) * Math.max(w, h);
+  let FW = w + 2 * m;
+  let FH = h + 2 * m;
+  if (f.aspect && f.aspect !== 'none') {
+    const [a, b] = f.aspect.split(':').map(Number);
+    const A = a / b;
+    if (FW / FH > A) FH = FW / A;
+    else FW = FH * A;
+  }
+  return [FW, FH];
+}
+
+/** 여백 채우기: 흰색 · 검정 · 흐린 사진 */
+export function composeFrame(src, f, maxPixels = 16_000_000) {
+  if (!frameOn(f)) return src;
+  let [FW, FH] = frameDims(src.width, src.height, f);
+  const k = Math.min(1, Math.sqrt(maxPixels / (FW * FH)));
+  FW = Math.round(FW * k);
+  FH = Math.round(FH * k);
+  const w = Math.round(src.width * k);
+  const h = Math.round(src.height * k);
+  const out = im.makeCanvas(FW, FH);
+  const ctx = out.getContext('2d');
+  if (f.fill === 'blur') {
+    // 사진을 꽉 차게 키워 아주 흐리게 (작게 줄였다가 키움)
+    const s = Math.max(FW / src.width, FH / src.height);
+    const sw = Math.max(2, Math.round(FW / 24));
+    const sh = Math.max(2, Math.round(FH / 24));
+    const small = im.makeCanvas(sw, sh);
+    const sc = small.getContext('2d');
+    sc.imageSmoothingQuality = 'high';
+    sc.drawImage(src, (FW - src.width * s) / 2 / 24, (FH - src.height * s) / 2 / 24, (src.width * s) / 24, (src.height * s) / 24);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(small, 0, 0, FW, FH);
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.fillRect(0, 0, FW, FH);
+  } else {
+    ctx.fillStyle = f.fill === 'black' ? '#000000' : '#ffffff';
+    ctx.fillRect(0, 0, FW, FH);
+  }
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(src, Math.round((FW - w) / 2), Math.round((FH - h) / 2), w, h);
   return out;
 }
