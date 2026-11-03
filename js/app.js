@@ -2,7 +2,7 @@
 import * as lib from './library.js';
 import { store } from './library.js';
 import { readInbox, clearInbox } from './db.js';
-import { detectType, kindOf, extOf, readExifDetails } from './media.js';
+import { detectType, kindOf, extOf, readExifDetails, stripGps } from './media.js';
 import {
   icon, esc, fmtNum, fmtBytes, fmtDuration, fmtDay, fmtDateTime, fmtCounts, dayKey,
   toast, openModal, confirmDialog, promptDialog, actionSheet, progress, downloadBlob, isModalOpen,
@@ -12,8 +12,11 @@ import { Viewer } from './viewer.js';
 import { Editor } from './editor.js';
 import * as lock from './lock.js';
 import { createScroller } from './scroller.js';
+import { reviewEnhance, runBatchEnhance, STRENGTHS } from './enhance.js';
+import { openCollage } from './collage.js';
+import { canvasToBlob } from './imaging.js';
 
-const APP_VERSION = '2.0';
+const APP_VERSION = '3.0';
 
 const $ = (s, root = document) => root.querySelector(s);
 const appbar = $('#appbar');
@@ -35,7 +38,7 @@ const canPickFolder = 'webkitdirectory' in document.createElement('input') && !i
 const GRID_SIZES = { s: '작게', m: '보통', l: '크게' };
 const GRID_ORDER = ['s', 'm', 'l'];
 const THEMES = { system: '시스템 설정', light: '밝게', dark: '어둡게' };
-const prefs = { grid: 'm', theme: 'system' };
+const prefs = { grid: 'm', theme: 'system', stripGps: true, enhanceStrength: 1 };
 try {
   Object.assign(prefs, JSON.parse(localStorage.getItem('pv-prefs') || '{}'));
 } catch {
@@ -79,6 +82,7 @@ let navigatedInApp = false;
 let askedPersist = false;
 let editor = null;
 let searchQuery = '';
+let hiddenUnlocked = false;
 const scrollMemory = new Map();
 const scroller = createScroller({
   topInset: () => Math.max(0, appbar.getBoundingClientRect().bottom),
@@ -115,30 +119,41 @@ window.addEventListener('popstate', () => {
 
 function parseRoute() {
   const [name, id] = location.hash.replace(/^#\/?/, '').split('/');
-  if (name === 'album' && id) return { name: 'album', id: decodeURIComponent(id) };
-  if (['photos', 'albums', 'favorites', 'videos', 'trash', 'backup', 'search', 'settings'].includes(name)) return { name };
+  if ((name === 'album' || name === 'smart') && id) return { name, id: decodeURIComponent(id) };
+  if (['photos', 'albums', 'favorites', 'videos', 'trash', 'backup', 'search', 'settings', 'enhance', 'cleanup', 'similar', 'hidden'].includes(name)) return { name };
   return { name: 'photos' };
 }
 
 const routeKey = (r) => r.name + (r.id ? `/${r.id}` : '');
 const TAB_OF = {
   photos: 'photos', search: 'photos', albums: 'albums', album: 'albums', favorites: 'albums', videos: 'albums', trash: 'albums',
-  backup: 'backup', settings: 'backup',
+  cleanup: 'albums', similar: 'albums', hidden: 'albums', smart: 'albums',
+  enhance: 'enhance', backup: 'backup', settings: 'backup',
 };
-const isGalleryRoute = () => ['photos', 'favorites', 'videos', 'album', 'trash', 'search'].includes(route.name);
+const tabOf = (r) => (r.name === 'smart' && r.id === 'edited' ? 'enhance' : TAB_OF[r.name]);
+const ROOT_ROUTES = ['photos', 'albums', 'enhance', 'backup'];
+const isGalleryRoute = () => ['photos', 'favorites', 'videos', 'album', 'trash', 'search', 'hidden', 'smart'].includes(route.name);
+const SMART = {
+  blurry: { title: '흐릿한 사진', empty: '흐릿해 보이는 사진이 없어요', list: () => lib.blurryMedia() },
+  screenshots: { title: '스크린샷', empty: '스크린샷이 없어요', list: () => lib.screenshotMedia() },
+  large: { title: '큰 동영상', empty: '50MB가 넘는 동영상이 없어요', list: () => lib.largeVideos() },
+  edited: { title: '보정한 사진', empty: '아직 보정하거나 편집한 사진이 없어요', list: () => lib.visibleMedia().filter((m) => m.edited) },
+};
 
 window.addEventListener('hashchange', () => {
   scrollMemory.set(routeKey(route), window.scrollY);
   navigatedInApp = true;
   closeLayersSilently();
   route = parseRoute();
+  if (route.name !== 'hidden') hiddenUnlocked = false; // 숨긴 항목은 열 때마다 PIN 확인
   render();
   window.scrollTo(0, scrollMemory.get(routeKey(route)) || 0);
 });
 
 function goBack() {
   if (navigatedInApp) history.back();
-  else location.replace(route.name === 'search' ? '#/photos' : route.name === 'settings' ? '#/backup' : '#/albums');
+  else if (route.name === 'similar' || (route.name === 'smart' && route.id !== 'edited')) location.replace('#/cleanup');
+  else location.replace(`#/${tabOf(route) === 'albums' ? 'albums' : tabOf(route)}`);
 }
 
 /* ---------- 썸네일 ---------- */
@@ -201,9 +216,11 @@ const mainThumbs = createThumbLoader();
 
 function computeList() {
   switch (route.name) {
-    case 'photos': return lib.activeMedia();
-    case 'favorites': return lib.activeMedia().filter((m) => m.favorite);
-    case 'videos': return lib.activeMedia().filter((m) => m.kind === 'video');
+    case 'photos': return lib.visibleMedia();
+    case 'favorites': return lib.visibleMedia().filter((m) => m.favorite);
+    case 'videos': return lib.visibleMedia().filter((m) => m.kind === 'video');
+    case 'hidden': return lib.hiddenMedia();
+    case 'smart': return SMART[route.id]?.list() || [];
     case 'album': return lib.albumMedia(route.id);
     case 'trash': return lib.trashedMedia();
     case 'search': return searchMedia(searchQuery);
@@ -236,7 +253,7 @@ function searchMedia(q) {
     if (t === '편집한' || t === '편집된') return '편집';
     return t;
   });
-  return lib.activeMedia().filter((m) => {
+  return lib.visibleMedia().filter((m) => {
     const text = searchText(m);
     return norm.every((t) => text.includes(t));
   });
@@ -247,7 +264,7 @@ function searchMedia(q) {
 function memories() {
   const now = new Date();
   const groups = new Map();
-  for (const m of lib.activeMedia()) {
+  for (const m of lib.visibleMedia()) {
     const d = new Date(m.takenAt);
     const years = now.getFullYear() - d.getFullYear();
     if (years < 1) continue;
@@ -276,24 +293,39 @@ function tileHTML(m, i, { trash = false, selected } = {}) {
   return `<div class="${cls}" data-i="${i}" data-id="${esc(m.id)}" role="button" tabindex="0" aria-label="${kindLabel}, ${esc(fmtDateTime(m.takenAt))}">${inner}${badges}<span class="tick">${icon('check')}</span></div>`;
 }
 
+const monthKey = (ms) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${d.getMonth() + 1}`;
+};
+function fmtMonth(ms) {
+  const d = new Date(ms);
+  const now = new Date();
+  if (d.getFullYear() === now.getFullYear()) return d.getMonth() === now.getMonth() ? '이번 달' : `${d.getMonth() + 1}월`;
+  return `${d.getFullYear()}년 ${d.getMonth() + 1}월`;
+}
+/** '작게' 보기에서는 월 단위, 나머지는 날짜 단위로 묶습니다. */
+const byMonth = () => prefs.grid === 's';
+const groupKey = (ms) => (byMonth() ? monthKey(ms) : dayKey(ms));
+
 function galleryHTML(items, { trash = false, selected } = {}) {
   if (trash) {
     return `<div class="grid">${items.map((m, i) => tileHTML(m, i, { trash, selected })).join('')}</div>`;
   }
+  const month = byMonth();
   let html = '';
   let i = 0;
   while (i < items.length) {
-    const key = dayKey(items[i].takenAt);
+    const key = groupKey(items[i].takenAt);
     let j = i;
     let tiles = '';
-    while (j < items.length && dayKey(items[j].takenAt) === key) {
+    while (j < items.length && groupKey(items[j].takenAt) === key) {
       tiles += tileHTML(items[j], j, { selected });
       j++;
     }
     html += `<section class="day" data-day="${key}">
       <header class="day-head">
         <button type="button" class="day-check" data-day="${key}" aria-label="이 날짜 모두 선택"><span class="tick">${icon('check')}</span></button>
-        <h3>${fmtDay(items[i].takenAt)}</h3><span class="day-count">${fmtNum(j - i)}</span>
+        <h3>${month ? fmtMonth(items[i].takenAt) : fmtDay(items[i].takenAt)}</h3><span class="day-count">${fmtNum(j - i)}</span>
       </header>
       <div class="grid">${tiles}</div>
     </section>`;
@@ -367,7 +399,7 @@ function renderAppbar() {
     if (!searchQuery) setTimeout(() => input.focus(), 50);
     return;
   }
-  const root = ['photos', 'albums', 'backup'].includes(route.name);
+  const root = ROOT_ROUTES.includes(route.name);
   let title = '';
   let sub = '';
   let actions = '';
@@ -410,6 +442,26 @@ function renderAppbar() {
     case 'settings':
       title = '설정';
       break;
+    case 'enhance':
+      title = '보정';
+      actions = iconBtn('enhance-manual', 'tune', '직접 보정');
+      break;
+    case 'cleanup':
+      title = '정리 도우미';
+      break;
+    case 'similar':
+      title = '비슷한 사진';
+      break;
+    case 'hidden':
+      title = '숨긴 항목';
+      sub = hiddenGate() ? '' : counts();
+      actions = list.length && !hiddenGate() ? iconBtn('menu', 'more', '더보기') : '';
+      break;
+    case 'smart':
+      title = SMART[route.id]?.title || '';
+      sub = counts();
+      actions = list.length ? `<button type="button" class="text-btn" data-act="select">선택</button>` : '';
+      break;
     default:
   }
   appbar.className = `appbar${root ? ' is-root' : ''}`;
@@ -420,7 +472,7 @@ function renderAppbar() {
 }
 
 function renderTabbar() {
-  const active = TAB_OF[route.name];
+  const active = tabOf(route);
   tabbar.querySelectorAll('.tab').forEach((t) => {
     const on = t.dataset.tab === active;
     t.classList.toggle('active', on);
@@ -437,15 +489,19 @@ function renderSelbar() {
   }
   const items = [...sel.ids].map((id) => store.byId.get(id)).filter(Boolean);
   const allFav = items.length > 0 && items.every((m) => m.favorite);
-  const buttons = route.name === 'trash'
-    ? [['restore', 'restore', '복원'], ['delete-forever', 'trash', '영구 삭제']]
-    : [
+  let buttons;
+  if (route.name === 'trash') buttons = [['restore', 'restore', '복원'], ['delete-forever', 'trash', '영구 삭제']];
+  else if (route.name === 'hidden') {
+    buttons = [['unhide', 'image', '숨김 해제'], ['share', 'share', '공유'], ['download', 'download', '저장'], ['delete', 'trash', '삭제']];
+  } else {
+    buttons = [
       ['share', 'share', '공유'],
       ['favorite', allFav ? 'heart' : 'heartOutline', allFav ? '즐겨찾기 해제' : '즐겨찾기'],
       route.name === 'album' ? ['remove-from-album', 'removeCircle', '앨범에서 빼기'] : ['add-to-album', 'albums', '앨범에 추가'],
-      ['download', 'download', '저장'],
       ['delete', 'trash', '삭제'],
+      ['sel-more', 'more', '더보기'],
     ];
+  }
   const disabled = items.length ? '' : ' disabled';
   selbar.innerHTML = buttons.map(([act, ic, label]) => `<button type="button" class="sel-btn" data-act="${act}"${disabled}>${icon(ic)}<span>${label}</span></button>`).join('');
 }
@@ -458,6 +514,9 @@ function renderMain() {
   else if (route.name === 'albums') renderAlbums();
   else if (route.name === 'backup') renderBackup();
   else if (route.name === 'settings') renderSettings();
+  else if (route.name === 'enhance') renderEnhance();
+  else if (route.name === 'cleanup') renderCleanup();
+  else if (route.name === 'similar') renderSimilar();
   if (isGalleryRoute() && store.loaded) requestAnimationFrame(() => scroller.refresh(main));
   else scroller.disable();
 }
@@ -466,7 +525,17 @@ function emptyHTML({ ic, title, text, buttons = '' }) {
   return `<div class="empty"><div class="empty-icon">${icon(ic)}</div><h2>${title}</h2><p>${text}</p>${buttons ? `<div class="empty-actions">${buttons}</div>` : ''}</div>`;
 }
 
+/** 앱 잠금이 켜져 있으면 숨긴 항목은 PIN을 확인한 뒤에 보여줍니다. */
+const hiddenGate = () => route.name === 'hidden' && lock.isLockEnabled() && !hiddenUnlocked;
+
 function renderGallery() {
+  if (hiddenGate()) {
+    main.innerHTML = emptyHTML({
+      ic: 'lock', title: '숨긴 항목은 잠겨 있어요', text: 'PIN을 입력하면 볼 수 있어요.',
+      buttons: `<button type="button" class="btn primary" data-act="unlock-hidden">${icon('lock')}PIN 입력</button>`,
+    });
+    return;
+  }
   if (route.name === 'album' && !lib.getAlbum(route.id)) {
     main.innerHTML = emptyHTML({ ic: 'albums', title: '앨범을 찾을 수 없어요', text: '삭제되었거나 잘못된 주소예요.', buttons: '<a class="btn primary" href="#/albums">앨범 목록으로</a>' });
     return;
@@ -480,6 +549,12 @@ function renderGallery() {
     if (list.length) html += `<p class="result-count">검색 결과 ${fmtNum(list.length)}개</p>`;
   }
   if (route.name === 'photos' && !sel.active) html += memoriesHTML();
+  if (route.name === 'hidden' && !lock.isLockEnabled()) {
+    html += `<div class="banner">${icon('info')}<span>설정에서 앱 잠금을 켜면 숨긴 항목을 열 때 PIN을 물어봐요.</span></div>`;
+  }
+  if (route.name === 'smart' && route.id === 'blurry' && list.length) {
+    html += `<div class="banner">${icon('info')}<span>초점이 맞지 않거나 흔들려 보이는 사진이에요. 필요 없는 사진을 골라 지워 보세요.</span></div>`;
+  }
   if (route.name === 'trash') {
     html += `<div class="banner">${icon('info')}<span>휴지통의 항목은 ${lib.TRASH_DAYS}일이 지나면 영구 삭제돼요. 타일의 숫자는 남은 날짜예요.</span></div>`;
   }
@@ -497,6 +572,8 @@ function renderGallery() {
         buttons: `<button type="button" class="btn primary" data-act="album-pick">${icon('photos')}보관함에서 고르기</button><button type="button" class="btn" data-act="album-upload">${icon('upload')}기기에서 올리기</button>`,
       },
       trash: { ic: 'trash', title: '휴지통이 비어 있어요', text: '삭제한 항목은 여기에서 30일 동안 복원할 수 있어요.' },
+      hidden: { ic: 'lock', title: '숨긴 항목이 없어요', text: '사진을 길게 눌러 선택한 뒤 ⋮ → ‘숨기기’를 누르면 여기로 옮겨져요.<br>숨긴 사진은 사진 탭·검색·추억에 나오지 않아요.' },
+      smart: { ic: 'check', title: SMART[route.id]?.empty || '항목이 없어요', text: '정리할 항목이 없어요.' },
       search: { ic: 'search', title: '검색 결과가 없어요', text: `‘${esc(searchQuery)}’와 일치하는 사진이 없어요.<br>‘2025년 10월’, ‘동영상’, 앨범 이름처럼 검색해 보세요.` },
     }[route.name];
     main.innerHTML = html + emptyHTML(empty);
@@ -526,7 +603,7 @@ function memoriesHTML() {
 }
 
 function searchSuggestionsHTML() {
-  const active = lib.activeMedia();
+  const active = lib.visibleMedia();
   const year = new Date().getFullYear();
   const chips = [];
   if (active.some((m) => m.kind === 'video')) chips.push(['video', '동영상']);
@@ -573,7 +650,8 @@ function setSearch(q) {
 }
 
 function segmented(act, options, current) {
-  return `<div class="segmented" role="radiogroup">${Object.entries(options).map(([v, label]) => `<button type="button" role="radio" aria-checked="${v === String(current)}" class="${v === String(current) ? 'on' : ''}" data-act="${act}" data-v="${v}">${label}</button>`).join('')}</div>`;
+  const entries = Array.isArray(options) ? options : Object.entries(options);
+  return `<div class="segmented" role="radiogroup">${entries.map(([v, label]) => `<button type="button" role="radio" aria-checked="${v === String(current)}" class="${v === String(current) ? 'on' : ''}" data-act="${act}" data-v="${v}">${label}</button>`).join('')}</div>`;
 }
 
 function renderSettings() {
@@ -603,6 +681,14 @@ function renderSettings() {
       </section>
       ${lockOn ? '<p class="setting-note">앱 잠금은 다른 사람이 앱 화면을 보지 못하게 막는 기능이에요. PIN을 잊으면 모든 데이터를 지워야 하니, 백업 파일을 꼭 만들어 두세요.</p>' : ''}
 
+      <h3 class="section-title">개인정보</h3>
+      <section class="card list">
+        <button type="button" class="row" data-act="toggle-strip-gps" role="switch" aria-checked="${prefs.stripGps}">
+          ${icon('place')}<div><strong>공유할 때 위치 정보 빼기</strong><small>다른 앱으로 사진을 보낼 때 촬영 위치(GPS)를 지워서 보내요. 보관함의 사진은 그대로예요.</small></div>
+          <span class="switch${prefs.stripGps ? ' on' : ''}"><i></i></span>
+        </button>
+      </section>
+
       <h3 class="section-title">저장공간</h3>
       <section class="card list">
         <div class="row static">${icon('storage')}<div><strong>보관 중</strong><small>${fmtCounts(t)} · ${fmtBytes(t.bytes)}</small></div></div>
@@ -618,6 +704,214 @@ function renderSettings() {
     </div>`;
 }
 
+/* ---------- 보정 탭 ---------- */
+
+const ENHANCE_CATS = {
+  dark: { title: '어두운 사진', text: '밝기와 그림자를 살려요', ic: 'theme' },
+  bright: { title: '너무 밝은 사진', text: '날아간 하늘·하이라이트를 되살려요', ic: 'auto' },
+  flat: { title: '뿌연 사진', text: '대비와 선명함을 더해요', ic: 'tune' },
+  cast: { title: '색이 치우친 사진', text: '누렇거나 푸르게 뜬 색을 바로잡아요', ic: 'filter' },
+};
+
+function analysisStatusHTML() {
+  const a = lib.analysis;
+  if (!a.running) return '';
+  return `<div class="analysis" id="analysis-status"><i></i><span>사진을 분석하는 중… ${fmtNum(a.done)} / ${fmtNum(a.total)}</span></div>`;
+}
+
+function startAnalysis() {
+  lib.ensureStats((a) => {
+    const el = document.getElementById('analysis-status');
+    if (el) el.querySelector('span').textContent = `사진을 분석하는 중… ${fmtNum(a.done)} / ${fmtNum(a.total)}`;
+  });
+  if (lib.analysis.running && !document.getElementById('analysis-status')) {
+    main.querySelector('.page')?.insertAdjacentHTML('afterbegin', analysisStatusHTML());
+  }
+}
+
+function thumbStrip(items, max = 4) {
+  return `<span class="strip">${items.slice(0, max).map((m) => {
+    const url = thumbURL(m);
+    return url ? `<img src="${url}" alt="" draggable="false">` : '<i></i>';
+  }).join('')}</span>`;
+}
+
+function renderEnhance() {
+  const cats = lib.enhanceSuggestions();
+  const entries = Object.entries(cats).filter(([, items]) => items.length);
+  const edited = lib.visibleMedia().filter((m) => m.edited);
+  const images = lib.visibleMedia().filter((m) => m.kind === 'image');
+  main.innerHTML = `
+    <div class="page">
+      ${analysisStatusHTML()}
+      <section class="card hero enhance-hero">
+        <div class="hero-top">
+          <div class="hero-icon">${icon('auto')}</div>
+          <div><h2>자동 보정</h2><p>사진을 분석해서 밝기·대비·하이라이트·그림자·색감을 알맞게 맞춰요. 편집 전 원본은 보관돼서 언제든 되돌릴 수 있어요.</p></div>
+        </div>
+        <div class="setting gap"><div><strong>보정 강도</strong></div></div>
+        ${segmented('set-strength', STRENGTHS, prefs.enhanceStrength)}
+        <div class="btn-row">
+          <button type="button" class="btn primary" data-act="enhance-pick"${images.length ? '' : ' disabled'}>${icon('auto')}사진 골라서 자동 보정</button>
+          <button type="button" class="btn" data-act="enhance-manual"${images.length ? '' : ' disabled'}>${icon('tune')}직접 세부 보정</button>
+        </div>
+      </section>
+
+      <h3 class="section-title">보정 추천</h3>
+      ${entries.length ? `<div class="suggestions">${entries.map(([k, items]) => `
+        <button type="button" class="suggestion" data-act="enhance-cat" data-cat="${k}">
+          ${thumbStrip(items)}
+          <span class="suggestion-text"><strong>${ENHANCE_CATS[k].title} <em>${fmtNum(items.length)}</em></strong><small>${ENHANCE_CATS[k].text}</small></span>
+          ${icon('chevronRight', 'row-chev')}
+        </button>`).join('')}</div>`
+    : `<div class="card empty-card">${icon('check', 'ok-ic')}<span>${images.length ? (lib.analysis.running ? '분석이 끝나면 보정하면 좋아질 사진을 알려드려요.' : '지금은 보정이 꼭 필요한 사진이 없어요.') : '사진을 추가하면 보정하면 좋아질 사진을 찾아 드려요.'}</span></div>`}
+
+      <h3 class="section-title">장면별 보정</h3>
+      <div class="card"><p class="note">편집 화면의 <b>보정</b> 탭에서 인물·풍경·음식·야경·HDR·문서 중 장면을 고르면 그 장면에 맞게 보정해요. 그다음 <b>조정</b> 탭에서 밝기·노출·대비·하이라이트·그림자·채도·생동감·색온도·명료도·선명도를 하나씩 다듬을 수 있어요.</p>
+        <button type="button" class="btn" data-act="enhance-manual"${images.length ? '' : ' disabled'}>${icon('tune')}사진 골라서 편집하기</button></div>
+
+      <div class="card list">
+        <a class="row" href="#/smart/edited">${icon('restore')}<div><strong>보정한 사진</strong><small>${fmtNum(edited.length)}장 · 사진의 ⋮ 메뉴에서 원본으로 되돌릴 수 있어요</small></div>${icon('chevronRight', 'row-chev')}</a>
+      </div>
+    </div>`;
+  startAnalysis();
+}
+
+async function enhanceCategory(cat) {
+  const items = lib.enhanceSuggestions()[cat] || [];
+  if (!items.length) return;
+  const picked = await reviewEnhance({
+    title: ENHANCE_CATS[cat].title,
+    items,
+    thumbURL,
+    strength: prefs.enhanceStrength,
+    intro: `${ENHANCE_CATS[cat].text}. 보정하지 않을 사진은 눌러서 빼 주세요.`,
+  });
+  if (picked?.ids.length) await applyEnhance(picked);
+}
+
+async function applyEnhance({ ids, strength, asCopy }) {
+  busy++;
+  try {
+    const r = await runBatchEnhance(ids, { strength, asCopy });
+    const parts = [`${fmtNum(r.done)}장을 ${asCopy ? '보정해서 사본으로 저장했어요' : '보정했어요'}`];
+    if (r.failed) parts.push(`${fmtNum(r.failed)}장은 열 수 없어 건너뜀`);
+    if (r.stopped) parts.unshift('중지했어요');
+    toast(parts.join(' · '), { duration: 5000 });
+  } finally {
+    busy--;
+  }
+}
+
+/* ---------- 정리 도우미 ---------- */
+
+function renderCleanup() {
+  const groups = lib.similarGroups();
+  const extra = groups.reduce((n, g) => n + g.length - 1, 0);
+  const blurry = lib.blurryMedia();
+  const shots = lib.screenshotMedia();
+  const large = lib.largeVideos();
+  const card = (href, ic, title, count, text, items) => `
+    <a class="suggestion" href="${href}">
+      ${items.length ? thumbStrip(items) : `<span class="strip empty">${icon(ic)}</span>`}
+      <span class="suggestion-text"><strong>${title} <em>${count}</em></strong><small>${text}</small></span>
+      ${icon('chevronRight', 'row-chev')}
+    </a>`;
+  main.innerHTML = `
+    <div class="page">
+      ${analysisStatusHTML()}
+      <p class="note">공간을 차지하는 사진을 찾아 드려요. 지운 사진은 휴지통에 ${lib.TRASH_DAYS}일 동안 남아 있어서 되살릴 수 있어요.</p>
+      <div class="suggestions">
+        ${card('#/similar', 'photos', '비슷한 사진', `${fmtNum(groups.length)}묶음`, extra ? `가장 잘 나온 사진만 남기면 ${fmtNum(extra)}장을 정리할 수 있어요` : '연속으로 찍은 비슷한 사진이 없어요', groups.flat())}
+        ${card('#/smart/blurry', 'image', '흐릿한 사진', `${fmtNum(blurry.length)}장`, '초점이 맞지 않거나 흔들린 사진', blurry)}
+        ${card('#/smart/screenshots', 'phone', '스크린샷', `${fmtNum(shots.length)}장`, `${fmtBytes(shots.reduce((n, m) => n + m.size, 0))} 차지`, shots)}
+        ${card('#/smart/large', 'video', '큰 동영상', `${fmtNum(large.length)}개`, `50MB 이상 · ${fmtBytes(large.reduce((n, m) => n + m.size, 0))} 차지`, large)}
+      </div>
+    </div>`;
+  startAnalysis();
+}
+
+let similarCache = [];
+
+function renderSimilar() {
+  similarCache = lib.similarGroups();
+  const extra = similarCache.reduce((n, g) => n + g.length - 1, 0);
+  if (!similarCache.length) {
+    main.innerHTML = `<div class="page">${analysisStatusHTML()}</div>${emptyHTML({ ic: 'photos', title: '비슷한 사진이 없어요', text: '연속으로 찍어 거의 같은 사진이 생기면 여기에 모아 드려요.' })}`;
+    startAnalysis();
+    return;
+  }
+  main.innerHTML = `
+    <div class="page wide">
+      ${analysisStatusHTML()}
+      <div class="similar-head">
+        <p>각 묶음에서 <b>가장 선명한 사진</b>을 남기도록 골라 뒀어요. 남길 사진을 바꾸려면 사진을 누르세요.</p>
+        <button type="button" class="btn primary" data-act="similar-all">${icon('trash')}${fmtNum(extra)}장 정리</button>
+      </div>
+      ${similarCache.map((g, gi) => `
+        <section class="similar-group" data-g="${gi}">
+          <header><strong>${fmtDay(g[0].takenAt)}</strong><small>${fmtNum(g.length)}장</small>
+            <button type="button" class="text-btn" data-act="similar-one" data-g="${gi}">나머지 ${fmtNum(g.length - 1)}장 정리</button></header>
+          <div class="similar-row">${g.map((m, i) => `
+            <button type="button" class="similar-item${i === 0 ? ' keep' : ''}" data-act="similar-keep" data-g="${gi}" data-id="${esc(m.id)}">
+              ${thumbURL(m) ? `<img src="${thumbURL(m)}" alt="" draggable="false">` : ''}
+              <span class="keep-badge">${icon('check')}남김</span>
+            </button>`).join('')}
+          </div>
+        </section>`).join('')}
+    </div>`;
+  startAnalysis();
+}
+
+async function cleanSimilar(groupIndexes) {
+  const ids = [];
+  for (const gi of groupIndexes) {
+    const sec = main.querySelector(`.similar-group[data-g="${gi}"]`);
+    if (!sec) continue;
+    sec.querySelectorAll('.similar-item:not(.keep)').forEach((b) => ids.push(b.dataset.id));
+  }
+  if (!ids.length) return;
+  const ok = await confirmDialog({ title: `${fmtNum(ids.length)}장을 정리할까요?`, message: `휴지통으로 옮겨지고 ${lib.TRASH_DAYS}일 동안 되살릴 수 있어요.`, ok: '정리', danger: true });
+  if (!ok) return;
+  await lib.moveToTrash(ids);
+  toast(`${fmtNum(ids.length)}장을 휴지통으로 옮겼어요`, { action: '실행 취소', onAction: () => lib.restore(ids) });
+}
+
+/* ---------- 콜라주 · 장면 캡처 ---------- */
+
+async function collageFlow(ids) {
+  let picked = ids;
+  if (!picked) {
+    picked = await pickFromLibrary({ title: '콜라주에 넣을 사진 (2~9장)', imagesOnly: true, max: 9, okLabel: '만들기', emptyText: '콜라주를 만들 사진이 없어요.' });
+    if (!picked) return;
+  }
+  const items = picked.map((id) => store.byId.get(id)).filter((m) => m && m.kind === 'image').slice(0, 9);
+  if (items.length < 2) {
+    toast('사진을 2장 이상 골라 주세요');
+    return;
+  }
+  await openCollage({
+    items: items.map((m) => ({ id: m.id })),
+    loadBlob: lib.getOriginal,
+    onSave: async (blob) => {
+      await runImport([{ blob, name: `collage-${stamp()}.jpg`, type: 'image/jpeg', takenAt: Date.now() }], '콜라주 저장하는 중');
+      toast('콜라주를 사진에 저장했어요');
+    },
+  });
+}
+
+async function captureVideoFrame(m) {
+  const shot = viewer?.captureFrame();
+  if (!shot) {
+    toast('동영상을 재생하거나 원하는 장면으로 옮긴 뒤 눌러 주세요');
+    return;
+  }
+  const blob = await canvasToBlob(shot.canvas, 'image/jpeg');
+  const base = m.name.replace(/\.[^.]+$/, '');
+  await runImport([{ blob, name: `${base}_${Math.floor(shot.time)}s.jpg`, type: 'image/jpeg', takenAt: m.takenAt + Math.round(shot.time * 1000) }], '장면 저장하는 중');
+  toast('지금 장면을 사진으로 저장했어요');
+}
+
 function albumCard(href, name, count, cover, ic) {
   const url = cover ? thumbURL(cover) : null;
   return `<a class="album-card" href="${href}">
@@ -626,7 +920,7 @@ function albumCard(href, name, count, cover, ic) {
 }
 
 function renderAlbums() {
-  const active = lib.activeMedia();
+  const active = lib.visibleMedia();
   const favs = active.filter((m) => m.favorite);
   const vids = active.filter((m) => m.kind === 'video');
   const trash = lib.trashedMedia();
@@ -649,7 +943,14 @@ function renderAlbums() {
           <div class="album-cover empty">${icon('add')}</div><strong>새 앨범</strong><small>${store.albums.length ? '' : '사진을 주제별로 정리해 보세요'}</small>
         </button>
       </div>
+      <h2 class="section-title">도구</h2>
+      <div class="tools">
+        <button type="button" class="tool" data-act="collage-new">${icon('grid')}<strong>콜라주</strong><small>여러 장을 한 장으로</small></button>
+        <a class="tool" href="#/enhance">${icon('auto')}<strong>자동 보정</strong><small>밝기·색감 맞추기</small></a>
+        <a class="tool" href="#/cleanup">${icon('storage')}<strong>정리 도우미</strong><small>비슷한·흐린 사진</small></a>
+      </div>
       <div class="card list">
+        <a class="row" href="#/hidden">${icon('lock')}<div><strong>숨긴 항목</strong><small>${lock.isLockEnabled() ? 'PIN으로 보호돼요' : `${fmtNum(lib.hiddenMedia().length)}개`}</small></div>${icon('chevronRight', 'row-chev')}</a>
         <a class="row" href="#/trash">${icon('trash')}<div><strong>휴지통</strong><small>${fmtNum(trash.length)}개 · ${lib.TRASH_DAYS}일 후 자동 삭제</small></div>${icon('chevronRight', 'row-chev')}</a>
       </div>
     </div>`;
@@ -784,7 +1085,7 @@ function updateSelectionUI() {
 }
 
 function toggleDay(key) {
-  const ids = list.filter((m) => dayKey(m.takenAt) === key).map((m) => m.id);
+  const ids = list.filter((m) => groupKey(m.takenAt) === key).map((m) => m.id);
   const all = ids.every((id) => sel.ids.has(id));
   if (!sel.active) enterSelection();
   ids.forEach((id) => (all ? sel.ids.delete(id) : sel.ids.add(id)));
@@ -804,12 +1105,73 @@ main.addEventListener('pointerdown', (e) => {
     press.fired = true;
     navigator.vibrate?.(15);
     if (!sel.active) enterSelection();
-    sel.ids.add(tile.dataset.id);
+    const id = tile.dataset.id;
+    const adding = !sel.ids.has(id);
+    // 끌어서 여러 장 선택: 손을 떼지 않고 움직이면 지나간 사진이 모두 선택돼요
+    drag = { anchor: +tile.dataset.i, base: new Set(sel.ids), adding, x: press.x, y: press.y, last: -1 };
+    if (adding) sel.ids.add(id);
+    else sel.ids.delete(id);
     sel.anchor = +tile.dataset.i;
     updateSelectionUI();
+    startAutoScroll();
   }, 420);
   lp = press;
 });
+
+let drag = null;
+let autoScroll = 0;
+
+function dragSelectAt(x, y) {
+  if (!drag) return;
+  const tile = document.elementFromPoint(x, y)?.closest?.('.tile');
+  if (!tile || !main.contains(tile)) return;
+  const i = +tile.dataset.i;
+  if (i === drag.last) return;
+  drag.last = i;
+  const ids = new Set(drag.base);
+  const [a, b] = [Math.min(drag.anchor, i), Math.max(drag.anchor, i)];
+  for (let k = a; k <= b; k++) {
+    if (!list[k]) continue;
+    if (drag.adding) ids.add(list[k].id);
+    else ids.delete(list[k].id);
+  }
+  sel.ids = ids;
+  updateSelectionUI();
+}
+
+function startAutoScroll() {
+  clearInterval(autoScroll);
+  autoScroll = setInterval(() => {
+    if (!drag) return;
+    const top = appbar.getBoundingClientRect().bottom + 50;
+    const bottom = window.innerHeight - (window.innerWidth >= 900 ? 20 : tabbar.offsetHeight) - 50;
+    let dy = 0;
+    if (drag.y < top) dy = -Math.min(24, (top - drag.y) / 2 + 4);
+    else if (drag.y > bottom) dy = Math.min(24, (drag.y - bottom) / 2 + 4);
+    if (dy) {
+      window.scrollBy(0, dy);
+      drag.last = -1;
+      dragSelectAt(drag.x, drag.y);
+    }
+  }, 30);
+}
+
+function endDrag() {
+  drag = null;
+  clearInterval(autoScroll);
+}
+
+window.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  drag.x = e.clientX;
+  drag.y = e.clientY;
+  dragSelectAt(e.clientX, e.clientY);
+});
+window.addEventListener('pointerup', endDrag);
+window.addEventListener('pointercancel', endDrag);
+main.addEventListener('touchmove', (e) => {
+  if (drag && e.cancelable) e.preventDefault(); // 선택하는 동안에는 화면이 스크롤되지 않게
+}, { passive: false });
 main.addEventListener('pointermove', (e) => {
   if (lp && !lp.fired && Math.hypot(e.clientX - lp.x, e.clientY - lp.y) > 10) {
     clearTimeout(lp.timer);
@@ -1010,6 +1372,9 @@ async function viewerMore(id) {
     items.push({ label: '날짜 및 시간 변경', icon: 'event', value: 'date' });
     if (route.name === 'album') items.push({ label: '앨범 표지로 설정', icon: 'image', value: 'cover' });
     if (m.edited) items.push({ label: '원본으로 되돌리기', icon: 'restore', value: 'revert', hint: '편집하기 전 사진으로 돌아가요' });
+    items.push(m.hidden
+      ? { label: '숨김 해제', icon: 'image', value: 'unhide', hint: '사진 탭에 다시 보여요' }
+      : { label: '숨기기', icon: 'lock', value: 'hide', hint: '사진 탭·검색·추억에서 숨겨요' });
   } else {
     items.push({ label: '기기에 저장', icon: 'download', value: 'download' });
   }
@@ -1048,7 +1413,18 @@ async function onViewerAction(act, id) {
       await viewerMore(id);
       break;
     case 'edit':
-      await openEditor(id);
+      if (m.kind === 'video') await captureVideoFrame(m);
+      else await openEditor(id);
+      break;
+    case 'hide':
+      await lib.setHidden([id], true);
+      if (route.name !== 'hidden') viewer?.removeCurrent();
+      toast('숨긴 항목으로 옮겼어요. 앨범 탭 → 숨긴 항목에서 볼 수 있어요.', { action: '실행 취소', onAction: () => lib.setHidden([id], false) });
+      break;
+    case 'unhide':
+      await lib.setHidden([id], false);
+      if (route.name === 'hidden') viewer?.removeCurrent();
+      toast('숨김을 해제했어요');
       break;
     case 'slideshow':
       viewer?.startSlideshow();
@@ -1103,7 +1479,8 @@ async function shareItems(items) {
   }
   const files = [];
   for (const m of items) {
-    const blob = await lib.getOriginal(m.id);
+    let blob = await lib.getOriginal(m.id);
+    if (blob && prefs.stripGps && m.type === 'image/jpeg') blob = await stripGps(blob);
     if (blob) files.push(new File([blob], m.name, { type: m.type, lastModified: m.takenAt }));
   }
   if (!files.length || !navigator.canShare({ files })) {
@@ -1166,9 +1543,9 @@ async function addToAlbumFlow(ids) {
   return true;
 }
 
-function pickFromLibrary({ title, exclude }) {
+function pickFromLibrary({ title, exclude = new Set(), imagesOnly = false, max = 0, okLabel = '추가', emptyText = '보관함의 모든 사진이 이미 이 앨범에 있어요.' }) {
   return new Promise((resolve) => {
-    const items = lib.activeMedia().filter((m) => !exclude.has(m.id));
+    const items = lib.visibleMedia().filter((m) => !exclude.has(m.id) && (!imagesOnly || m.kind === 'image'));
     const chosen = new Set();
     const loader = createThumbLoader();
     const modal = openModal({
@@ -1177,9 +1554,9 @@ function pickFromLibrary({ title, exclude }) {
         <header class="picker-bar">
           <button type="button" class="icon-btn" data-x aria-label="닫기">${icon('close')}</button>
           <h2>${esc(title)}</h2>
-          <button type="button" class="btn primary sm" data-ok disabled>추가</button>
+          <button type="button" class="btn primary sm" data-ok disabled>${esc(okLabel)}</button>
         </header>
-        <div class="picker-body selecting-grid">${items.length ? galleryHTML(items, { selected: chosen }) : emptyHTML({ ic: 'photos', title: '고를 수 있는 사진이 없어요', text: '보관함의 모든 사진이 이미 이 앨범에 있어요.' })}</div>`,
+        <div class="picker-body selecting-grid">${items.length ? galleryHTML(items, { selected: chosen }) : emptyHTML({ ic: 'photos', title: '고를 수 있는 사진이 없어요', text: esc(emptyText) })}</div>`,
       onClose: (v) => {
         loader.reset();
         resolve(Array.isArray(v) ? v : null);
@@ -1191,8 +1568,9 @@ function pickFromLibrary({ title, exclude }) {
       body.querySelectorAll('.tile').forEach((t) => t.classList.toggle('sel', chosen.has(t.dataset.id)));
       updateDayChecks(body, chosen);
       ok.disabled = !chosen.size;
-      ok.textContent = chosen.size ? `추가 (${fmtNum(chosen.size)})` : '추가';
+      ok.textContent = chosen.size ? `${okLabel} (${fmtNum(chosen.size)})` : okLabel;
     };
+    const full = () => max && chosen.size >= max;
     modal.el.addEventListener('click', (e) => {
       if (e.target.closest('[data-x]')) return modal.close();
       if (e.target.closest('[data-ok]')) return modal.close([...chosen]);
@@ -1200,15 +1578,19 @@ function pickFromLibrary({ title, exclude }) {
       if (tile) {
         const id = tile.dataset.id;
         if (chosen.has(id)) chosen.delete(id);
+        else if (full()) toast(`최대 ${max}장까지 고를 수 있어요`);
         else chosen.add(id);
         sync();
         return;
       }
       const dc = e.target.closest('.day-check');
       if (dc) {
-        const ids = items.filter((m) => dayKey(m.takenAt) === dc.dataset.day).map((m) => m.id);
+        const ids = items.filter((m) => groupKey(m.takenAt) === dc.dataset.day).map((m) => m.id);
         const all = ids.every((id) => chosen.has(id));
-        ids.forEach((id) => (all ? chosen.delete(id) : chosen.add(id)));
+        ids.forEach((id) => {
+          if (all) chosen.delete(id);
+          else if (!full()) chosen.add(id);
+        });
         sync();
       }
     });
@@ -1347,6 +1729,7 @@ async function doImport(items, title) {
   try {
     const result = await lib.importFiles(items, (d, t, name) => progress.update(d, t, name || ''), () => stop);
     toast(importSummary(result), { duration: 4500 });
+    if (result.added) setTimeout(() => lib.ensureStats(), 1500);
     if (result.added && !askedPersist) {
       askedPersist = true;
       navigator.storage?.persist?.().catch(() => {});
@@ -1514,10 +1897,14 @@ async function galleryMenu() {
 function setGrid(size) {
   if (!GRID_SIZES[size] || size === prefs.grid) return;
   const anchor = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2)?.closest?.('.tile');
+  const anchorId = anchor?.dataset.id;
+  const monthBefore = byMonth();
   prefs.grid = size;
   savePrefs();
   document.documentElement.dataset.grid = size;
-  if (anchor?.isConnected) anchor.scrollIntoView({ block: 'center' });
+  if (monthBefore !== byMonth() && isGalleryRoute()) renderMain();
+  const target = anchorId && main.querySelector(`.tile[data-id="${CSS.escape(anchorId)}"]`);
+  if (target) target.scrollIntoView({ block: 'center' });
   scroller.refresh(main);
 }
 
@@ -1616,6 +2003,57 @@ async function handleAction(act, el) {
       break;
     case 'wipe':
       await wipeFlow();
+      break;
+    case 'toggle-strip-gps':
+      prefs.stripGps = !prefs.stripGps;
+      savePrefs();
+      render();
+      break;
+    case 'set-strength':
+      prefs.enhanceStrength = +el.dataset.v;
+      savePrefs();
+      render();
+      break;
+    case 'enhance-pick': {
+      const ids = await pickFromLibrary({ title: '자동 보정할 사진', imagesOnly: true, okLabel: '다음', emptyText: '보정할 사진이 없어요.' });
+      if (!ids?.length) return;
+      const picked = await reviewEnhance({
+        title: '자동 보정 미리보기',
+        items: ids.map((id) => store.byId.get(id)).filter(Boolean),
+        thumbURL,
+        strength: prefs.enhanceStrength,
+        intro: '왼쪽이 원본, 오른쪽이 보정 후예요. 보정하지 않을 사진은 눌러서 빼 주세요.',
+      });
+      if (picked?.ids.length) await applyEnhance(picked);
+      break;
+    }
+    case 'enhance-manual': {
+      const ids = await pickFromLibrary({ title: '보정할 사진 고르기', imagesOnly: true, max: 1, okLabel: '편집', emptyText: '보정할 사진이 없어요.' });
+      if (ids?.[0]) await openEditor(ids[0]);
+      break;
+    }
+    case 'enhance-cat':
+      await enhanceCategory(el.dataset.cat);
+      break;
+    case 'collage-new':
+      await collageFlow();
+      break;
+    case 'unlock-hidden':
+      if (await lock.verifyPin('숨긴 항목 보기')) {
+        hiddenUnlocked = true;
+        render();
+      }
+      break;
+    case 'similar-keep': {
+      const sec = el.closest('.similar-group');
+      sec.querySelectorAll('.similar-item').forEach((b) => b.classList.toggle('keep', b === el));
+      break;
+    }
+    case 'similar-one':
+      await cleanSimilar([+el.dataset.g]);
+      break;
+    case 'similar-all':
+      await cleanSimilar(similarCache.map((_, i) => i));
       break;
     case 'add':
       uploadAlbumId = null;
@@ -1733,6 +2171,51 @@ async function onSelectionAction(act) {
   const n = items.length;
   if (!n) return;
   switch (act) {
+    case 'sel-more': {
+      const images = items.filter((m) => m.kind === 'image');
+      const opts = [
+        { label: '기기에 저장', icon: 'download', value: 'download' },
+        { label: '자동 보정', icon: 'auto', value: 'auto-enhance', hint: images.length ? `사진 ${fmtNum(images.length)}장 · 미리 보고 적용해요` : '사진을 골라 주세요' },
+      ];
+      if (images.length >= 2 && images.length <= 9) opts.push({ label: '콜라주 만들기', icon: 'grid', value: 'collage' });
+      if (items.some((m) => m.edited)) opts.push({ label: '원본으로 되돌리기', icon: 'restore', value: 'revert-all' });
+      opts.push({ label: '숨기기', icon: 'lock', value: 'hide', hint: '사진 탭·검색·추억에서 숨겨요' });
+      const v = await actionSheet({ title: `${fmtNum(n)}개 선택됨`, items: opts });
+      if (v) await onSelectionAction(v);
+      break;
+    }
+    case 'auto-enhance': {
+      const images = items.filter((m) => m.kind === 'image');
+      if (!images.length) return;
+      const picked = await reviewEnhance({ title: '자동 보정 미리보기', items: images, thumbURL, strength: prefs.enhanceStrength, intro: '왼쪽이 원본, 오른쪽이 보정 후예요.' });
+      if (!picked?.ids.length) return;
+      exitSelection();
+      await applyEnhance(picked);
+      break;
+    }
+    case 'collage':
+      exitSelection();
+      await collageFlow(ids);
+      break;
+    case 'revert-all': {
+      const edited = items.filter((m) => m.edited);
+      const ok = await confirmDialog({ title: `${fmtNum(edited.length)}장을 원본으로 되돌릴까요?`, message: '편집·보정한 내용이 사라지고 편집하기 전 사진으로 돌아가요.', ok: '되돌리기' });
+      if (!ok) return;
+      for (const m of edited) await lib.revertEdit(m.id);
+      exitSelection();
+      toast(`${fmtNum(edited.length)}장을 원본으로 되돌렸어요`);
+      break;
+    }
+    case 'hide':
+      await lib.setHidden(ids, true);
+      exitSelection();
+      toast(`${fmtNum(n)}개를 숨겼어요`, { action: '실행 취소', onAction: () => lib.setHidden(ids, false) });
+      break;
+    case 'unhide':
+      await lib.setHidden(ids, false);
+      exitSelection();
+      toast(`${fmtNum(n)}개의 숨김을 해제했어요`);
+      break;
     case 'share':
       await shareItems(items);
       break;
@@ -1806,6 +2289,11 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) hiddenUnlocked = false;
+  else if (route.name === 'hidden') render();
+});
+
 window.addEventListener('beforeunload', (e) => {
   if (busy > 0) {
     e.preventDefault();
@@ -1829,6 +2317,7 @@ function buildTabbar() {
   tabbar.innerHTML = [
     ['photos', 'photos', '사진'],
     ['albums', 'albums', '앨범'],
+    ['enhance', 'auto', '보정'],
     ['backup', 'cloud', '백업'],
   ].map(([k, ic, label]) => `<a class="tab" href="#/${k}" data-tab="${k}">${icon(ic)}<span>${label}</span></a>`).join('');
 }

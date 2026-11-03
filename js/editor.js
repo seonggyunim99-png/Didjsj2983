@@ -3,6 +3,7 @@ import { icon, esc, toast, confirmDialog, actionSheet, isModalOpen } from './ui.
 import * as im from './imaging.js';
 
 const TABS = [
+  ['enhance', 'auto', '보정'],
   ['crop', 'crop', '자르기'],
   ['filter', 'filter', '필터'],
   ['adjust', 'tune', '조정'],
@@ -20,22 +21,7 @@ const MIN_CROP = 0.06;
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const signed = (v) => (v > 0 ? `+${v}` : `${v}`);
 
-async function decode(blob) {
-  try {
-    return await createImageBitmap(blob, { imageOrientation: 'from-image' });
-  } catch {
-    const url = URL.createObjectURL(blob);
-    try {
-      const img = new Image();
-      img.src = url;
-      await img.decode();
-      return img;
-    } finally {
-      URL.revokeObjectURL(url);
-    }
-  }
-}
-const dimsOf = (src) => [src.naturalWidth || src.width, src.naturalHeight || src.height];
+const { decode, dimsOf } = im;
 
 function aspectValue(aspect, fw, fh) {
   if (aspect === 'free') return null;
@@ -106,7 +92,7 @@ export class Editor {
     this.st = im.defaultState();
     this.history = [JSON.stringify(this.st)];
     this.hIndex = 0;
-    this.tab = 'crop';
+    this.tab = 'enhance';
     this.adjKey = 'brightness';
     this.tool = 'pen';
     this.color = '#ff3b30';
@@ -305,7 +291,15 @@ export class Editor {
     this.root.dataset.tab = this.tab;
     const st = this.st;
     let html = '';
-    if (this.tab === 'crop') {
+    if (this.tab === 'enhance') {
+      const en = st.enhance;
+      html = `
+        <button type="button" class="ed-auto-big${en.on ? ' on' : ''}" data-act="auto" aria-pressed="${en.on}">
+          ${icon('auto')}<span><strong>자동 보정${en.on ? ' 켜짐' : ''}</strong><small>${en.on ? '한 번 더 누르면 꺼져요 · 세부 값은 ‘조정’ 탭에서 바꿀 수 있어요' : '사진을 분석해서 밝기·대비·색감을 알맞게 맞춰요'}</small></span>
+        </button>
+        <div class="ed-chips">${im.SCENES.map((sc) => `<button type="button" class="ed-chip${en.on && en.scene === sc.id ? ' on' : ''}" data-scene="${sc.id}" title="${esc(sc.hint)}">${esc(sc.name)}</button>`).join('')}</div>
+        ${en.on ? this.sliderRow('strength', '강도', Math.round(en.strength * 100), 0, 150, 5, `${Math.round(en.strength * 100)}`, false) : `<p class="ed-hint">장면을 고르면 그 장면에 맞게 보정해요</p>`}`;
+    } else if (this.tab === 'crop') {
       html = `
         <div class="ed-chips">${ASPECTS.map(([k, label]) => `<button type="button" class="ed-chip${st.geo.aspect === k ? ' on' : ''}" data-aspect="${k}">${label}</button>`).join('')}</div>
         ${this.sliderRow('angle', '기울기', st.geo.angle, -45, 45, 0.5, `${signed(st.geo.angle)}°`)}
@@ -329,7 +323,7 @@ export class Editor {
       html = `
         ${this.sliderRow('adj', a.label, v, a.min, a.max, 1, signed(v), a.min < 0)}
         <div class="ed-chips">
-          <button type="button" class="ed-chip ed-auto${st.auto ? ' on' : ''}" data-act="auto">${icon('auto')}자동 보정</button>
+          <button type="button" class="ed-chip ed-auto${st.enhance.on ? ' on' : ''}" data-act="auto">${icon('auto')}자동 보정</button>
           ${im.ADJUSTMENTS.map((x) => `<button type="button" class="ed-chip${x.key === this.adjKey ? ' on' : ''}${st.adj[x.key] ? ' changed' : ''}" data-adj="${x.key}">${x.label}${st.adj[x.key] ? `<small>${signed(st.adj[x.key])}</small>` : ''}</button>`).join('')}
           <button type="button" class="ed-chip" data-act="reset-adj">${icon('restore')}모두 초기화</button>
         </div>`;
@@ -422,6 +416,12 @@ export class Editor {
         this.invalidate();
         break;
       }
+      case 'strength':
+        this.st.enhance.strength = v / 100;
+        out.textContent = `${v}`;
+        this.applyEnhance();
+        this.invalidate();
+        break;
       case 'size':
         this.sizes[this.tool] = v;
         out.textContent = `${v}`;
@@ -450,6 +450,20 @@ export class Editor {
       this.commit();
       this.renderPanel();
       this.paint();
+      return;
+    }
+    const scene = t.closest('[data-scene]');
+    if (scene) {
+      const en = this.st.enhance;
+      if (!en.on) {
+        en.prev = { adj: this.st.adj, auto: this.st.auto };
+        en.on = true;
+      }
+      en.scene = scene.dataset.scene;
+      this.applyEnhance();
+      this.commit();
+      this.renderPanel();
+      this.invalidate();
       return;
     }
     const filter = t.closest('[data-filter]');
@@ -529,21 +543,12 @@ export class Editor {
         this.layout();
         break;
       case 'auto':
-        if (this.st.auto) this.st.auto = null;
-        else {
-          const [fw, fh] = this.frame();
-          const k = 400 / Math.max(fw, fh);
-          const probe = im.renderBase(this.work, this.Ww, this.Hw, { ...im.defaultState(), geo: this.st.geo }, this.st.geo.crop,
-            Math.max(1, this.st.geo.crop.w * fw * k), Math.max(1, this.st.geo.crop.h * fh * k), k);
-          this.st.auto = im.autoLevels(probe.getContext('2d').getImageData(0, 0, probe.width, probe.height));
-        }
-        this.commit();
-        this.renderPanel();
-        this.invalidate();
+        this.toggleEnhance();
         break;
       case 'reset-adj':
         this.st.adj = im.defaultState().adj;
         this.st.auto = null;
+        this.st.enhance = im.defaultState().enhance;
         this.commit();
         this.renderPanel();
         this.invalidate();
@@ -562,6 +567,41 @@ export class Editor {
         break;
       default:
     }
+  }
+
+  /** 자동 보정 계산에 쓸 측정값 (현재 자르기·회전 상태 기준, 다른 보정은 빼고) */
+  measure() {
+    const [fw, fh] = this.frame();
+    const crop = this.st.geo.crop;
+    const k = 320 / Math.max(crop.w * fw, crop.h * fh);
+    const probe = im.renderBase(this.work, this.Ww, this.Hw, { ...im.defaultState(), geo: this.st.geo }, crop,
+      Math.max(1, crop.w * fw * k), Math.max(1, crop.h * fh * k), k);
+    return im.analyze(probe.getContext('2d').getImageData(0, 0, probe.width, probe.height));
+  }
+
+  applyEnhance() {
+    const en = this.st.enhance;
+    const { auto, adj } = im.autoAdjust(this.measure(), { strength: en.strength, scene: en.scene });
+    this.st.auto = auto;
+    this.st.adj = adj;
+  }
+
+  toggleEnhance() {
+    const en = this.st.enhance;
+    if (en.on) {
+      en.on = false;
+      this.st.adj = en.prev?.adj || im.defaultState().adj;
+      this.st.auto = en.prev?.auto || null;
+      en.prev = null;
+    } else {
+      en.prev = { adj: this.st.adj, auto: this.st.auto };
+      en.on = true;
+      if (!en.strength) en.strength = 1;
+      this.applyEnhance();
+    }
+    this.commit();
+    this.renderPanel();
+    this.invalidate();
   }
 
   handleKey(e) {
@@ -723,17 +763,7 @@ export class Editor {
       const [W, H] = dimsOf(src);
       const out = im.renderFull(src, W, H, this.st);
       src.close?.();
-      const png = this.type === 'image/png';
-      let canvas = out;
-      if (!png) {
-        canvas = im.makeCanvas(out.width, out.height);
-        const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(out, 0, 0);
-      }
-      const blob = await new Promise((res) => canvas.toBlob(res, png ? 'image/png' : 'image/jpeg', 0.92));
-      if (!blob) throw new Error('이미지를 만들지 못했어요');
+      const blob = await im.canvasToBlob(out, this.type);
       await this.onSave(blob, choice === 'copy');
     } catch (err) {
       console.error(err);

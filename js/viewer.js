@@ -206,7 +206,11 @@ export class Viewer {
       fav.classList.toggle('active', !!m.favorite);
     }
     const edit = this.root.querySelector('[data-act="edit"]');
-    if (edit) edit.disabled = m.kind !== 'image';
+    if (edit) {
+      // 동영상은 '편집' 대신 지금 장면을 사진으로 저장하는 '캡처'
+      edit.innerHTML = m.kind === 'video' ? `${icon('camera')}<span>캡처</span>` : `${icon('tune')}<span>편집</span>`;
+      edit.title = m.kind === 'video' ? '지금 장면을 사진으로 저장' : '편집';
+    }
     this.root.querySelector('.v-nav.prev').hidden = this.index <= 0;
     this.root.querySelector('.v-nav.next').hidden = this.index >= this.ids.length - 1;
     if (!this.root.querySelector('.v-info').hidden) this.renderInfo();
@@ -228,6 +232,17 @@ export class Viewer {
     this.renderSlot(this.slot, this.index);
     this.resetZoom(false);
     this.updateChrome();
+  }
+
+  /** 동영상의 지금 장면을 캔버스로 */
+  captureFrame() {
+    const v = this.slot.querySelector('video');
+    if (!v || v.readyState < 2 || !v.videoWidth) return null;
+    const c = document.createElement('canvas');
+    c.width = v.videoWidth;
+    c.height = v.videoHeight;
+    c.getContext('2d').drawImage(v, 0, 0);
+    return { canvas: c, time: v.currentTime };
   }
 
   /* ---------- 슬라이드쇼 ---------- */

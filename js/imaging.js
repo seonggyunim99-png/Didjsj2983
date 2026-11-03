@@ -8,8 +8,10 @@ export const ADJUSTMENTS = [
   { key: 'highlights', label: '하이라이트', min: -100, max: 100 },
   { key: 'shadows', label: '그림자', min: -100, max: 100 },
   { key: 'saturation', label: '채도', min: -100, max: 100 },
+  { key: 'vibrance', label: '생동감', min: -100, max: 100 },
   { key: 'warmth', label: '색온도', min: -100, max: 100 },
   { key: 'tint', label: '색조', min: -100, max: 100 },
+  { key: 'clarity', label: '명료도', min: -100, max: 100 },
   { key: 'sharpness', label: '선명도', min: 0, max: 100 },
   { key: 'vignette', label: '비네팅', min: 0, max: 100 },
   { key: 'fade', label: '페이드', min: 0, max: 100 },
@@ -20,6 +22,7 @@ export function defaultState() {
     geo: { q: 0, flipH: false, flipV: false, angle: 0, crop: { x: 0, y: 0, w: 1, h: 1 }, aspect: 'free' },
     adj: Object.fromEntries(ADJUSTMENTS.map((a) => [a.key, 0])),
     auto: null,
+    enhance: { on: false, scene: 'auto', strength: 1, prev: null },
     filter: 'none',
     filterAmt: 1,
     strokes: [],
@@ -131,27 +134,32 @@ export function applyAdjust(img, st) {
   const w = img.width;
   const h = img.height;
 
-  // 1) 레벨(자동 보정) → 노출 → 밝기(감마) → 대비 : 채널별 표로 미리 계산
-  const lut = new Float32Array(256);
+  // 1) 화이트밸런스(자동) → 레벨(자동) → 노출 → 밝기(감마) → 대비 : 채널별 표로 미리 계산
   const lv = st.auto;
+  const gains = lv?.wb || [1, 1, 1];
+  const luts = gains.map(() => new Float32Array(256));
   const ex = 2 ** ((a.exposure / 100) * 1.3);
   const b = a.brightness / 100;
   const gamma = b >= 0 ? 1 / (1 + b * 0.9) : 1 - b * 0.9;
   const ct = a.contrast >= 0 ? 1 + (a.contrast / 100) * 0.8 : 1 + (a.contrast / 100) * 0.65;
-  for (let v = 0; v < 256; v++) {
-    let x = v / 255;
-    if (lv) {
-      x = Math.min(1, Math.max(0, (x - lv.lo) / (lv.hi - lv.lo)));
-      x **= lv.gamma;
+  for (let c = 0; c < 3; c++) {
+    for (let v = 0; v < 256; v++) {
+      let x = Math.min(1, (v / 255) * gains[c]);
+      if (lv) {
+        x = Math.min(1, Math.max(0, (x - lv.lo) / (lv.hi - lv.lo)));
+        x **= lv.gamma;
+      }
+      x = Math.min(1.5, x * ex);
+      if (gamma !== 1) x = x <= 0 ? 0 : x ** gamma;
+      luts[c][v] = (x * 255 - 128) * ct + 128;
     }
-    x = Math.min(1.5, x * ex);
-    if (gamma !== 1) x = x <= 0 ? 0 : x ** gamma;
-    lut[v] = (x * 255 - 128) * ct + 128;
   }
+  const [lutR, lutG, lutB] = luts;
 
   const hl = a.highlights / 100;
   const sh = a.shadows / 100;
-  const sa = (1 + a.saturation / 100) * (lv ? 1.1 : 1);
+  const sa = (1 + a.saturation / 100) * (lv?.sat ?? 1);
+  const vb = (a.vibrance || 0) / 100;
   const wa = a.warmth / 100;
   const ti = a.tint / 100;
   const fade = a.fade / 100;
@@ -175,9 +183,9 @@ export function applyAdjust(img, st) {
 
   for (let y = 0, i = 0; y < h; y++) {
     for (let x = 0; x < w; x++, i += 4) {
-      let r = lut[d[i]];
-      let g = lut[d[i + 1]];
-      let bl = lut[d[i + 2]];
+      let r = lutR[d[i]];
+      let g = lutG[d[i + 1]];
+      let bl = lutB[d[i + 2]];
       if (hl || sh) {
         let L = (0.2126 * r + 0.7152 * g + 0.0722 * bl) / 255;
         L = L < 0 ? 0 : L > 1 ? 1 : L;
@@ -187,11 +195,19 @@ export function applyAdjust(img, st) {
         g += delta;
         bl += delta;
       }
-      if (sa !== 1) {
+      if (sa !== 1 || vb) {
         const L = 0.2126 * r + 0.7152 * g + 0.0722 * bl;
-        r = L + (r - L) * sa;
-        g = L + (g - L) * sa;
-        bl = L + (bl - L) * sa;
+        let f = sa;
+        if (vb) {
+          // 생동감: 색이 옅은 부분은 많이, 이미 진한 부분은 조금만
+          const mx = r > g ? (r > bl ? r : bl) : (g > bl ? g : bl);
+          const mn = r < g ? (r < bl ? r : bl) : (g < bl ? g : bl);
+          const c = Math.min(1, Math.max(0, (mx - mn) / 255));
+          f *= vb > 0 ? 1 + vb * (1 - c) * 1.2 : 1 + vb;
+        }
+        r = L + (r - L) * f;
+        g = L + (g - L) * f;
+        bl = L + (bl - L) * f;
       }
       if (wa) {
         r += wa * 24;
@@ -232,6 +248,75 @@ export function applyAdjust(img, st) {
   }
 }
 
+function boxBlur(src, w, h, r) {
+  const tmp = new Float32Array(w * h);
+  const out = new Float32Array(w * h);
+  const div = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let acc = 0;
+    for (let k = -r; k <= r; k++) acc += src[row + Math.min(w - 1, Math.max(0, k))];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = acc / div;
+      acc += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let acc = 0;
+    for (let k = -r; k <= r; k++) acc += tmp[Math.min(h - 1, Math.max(0, k)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = acc / div;
+      acc += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+/** 명료도: 넓은 범위의 명암 대비(디테일)를 살리거나(+) 부드럽게(-) 합니다. */
+export function clarity(img, amount) {
+  if (!amount) return;
+  const { width: w, height: h, data: d } = img;
+  const F = 4;
+  const sw = Math.max(1, Math.ceil(w / F));
+  const sh = Math.max(1, Math.ceil(h / F));
+  const sum = new Float32Array(sw * sh);
+  const cnt = new Float32Array(sw * sh);
+  for (let y = 0; y < h; y++) {
+    const sy = ((y / F) | 0) * sw;
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const j = sy + ((x / F) | 0);
+      sum[j] += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      cnt[j]++;
+    }
+  }
+  for (let j = 0; j < sum.length; j++) sum[j] /= cnt[j] || 1;
+  const r = Math.max(1, Math.round(Math.min(sw, sh) / 28));
+  const blur = boxBlur(boxBlur(sum, sw, sh, r), sw, sh, r);
+  const k = amount * 0.9;
+  for (let y = 0; y < h; y++) {
+    const fy = Math.min(sh - 1, Math.max(0, y / F - 0.5));
+    const y0 = fy | 0;
+    const y1 = Math.min(sh - 1, y0 + 1);
+    const ty = fy - y0;
+    for (let x = 0; x < w; x++) {
+      const fx = Math.min(sw - 1, Math.max(0, x / F - 0.5));
+      const x0 = fx | 0;
+      const x1 = Math.min(sw - 1, x0 + 1);
+      const tx = fx - x0;
+      const b = (blur[y0 * sw + x0] * (1 - tx) + blur[y0 * sw + x1] * tx) * (1 - ty)
+        + (blur[y1 * sw + x0] * (1 - tx) + blur[y1 * sw + x1] * tx) * ty;
+      const i = (y * w + x) * 4;
+      const L = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      const m = 2 * (L / 255) - 1;
+      const delta = k * (L - b) * (1 - m * m);
+      d[i] += delta;
+      d[i + 1] += delta;
+      d[i + 2] += delta;
+    }
+  }
+}
+
 export function sharpen(img, amount) {
   const k = amount * 0.8;
   if (!k) return;
@@ -252,32 +337,282 @@ export function sharpen(img, amount) {
   }
 }
 
-/** 자동 보정: 어두운 끝·밝은 끝을 펴고 중간 밝기를 맞춥니다. */
-export function autoLevels(img) {
-  const d = img.data;
+/* ---------- 사진 분석 · 자동 보정 ---------- */
+
+/** 밝기 분포, 색 치우침, 채도, 선명함(초점)을 측정합니다. 값은 0~1 기준 */
+export function analyze(img) {
+  const { data: d, width: w, height: h } = img;
+  const n = w * h;
   const hist = new Uint32Array(256);
-  let n = 0;
-  for (let i = 0; i < d.length; i += 16) {
-    hist[Math.round(0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2])]++;
-    n++;
+  const gray = new Float32Array(n);
+  let lum = 0;
+  let chroma = 0;
+  let sr = 0;
+  let sg = 0;
+  let sb = 0;
+  let mid = 0;
+  for (let p = 0, i = 0; p < n; p++, i += 4) {
+    const r = d[i];
+    const g = d[i + 1];
+    const b = d[i + 2];
+    const L = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    gray[p] = L;
+    hist[Math.min(255, Math.round(L))]++;
+    lum += L;
+    chroma += (Math.max(r, g, b) - Math.min(r, g, b)) / 255;
+    if (L > 40 && L < 215) {
+      sr += r;
+      sg += g;
+      sb += b;
+      mid++;
+    }
   }
-  const pick = (p) => {
+  const pct = (q) => {
     let acc = 0;
     for (let v = 0; v < 256; v++) {
       acc += hist[v];
-      if (acc >= n * p) return v / 255;
+      if (acc >= n * q) return v / 255;
     }
     return 1;
   };
-  let lo = pick(0.006);
-  let hi = pick(0.994);
-  const med = pick(0.5);
-  lo = Math.min(lo, 0.25);
-  hi = Math.max(hi, 0.75);
-  if (hi - lo < 0.2) return { lo: 0, hi: 1, gamma: 1 };
-  const m = Math.min(0.95, Math.max(0.05, (med - lo) / (hi - lo)));
-  const gamma = Math.min(1.5, Math.max(0.65, Math.log(0.48) / Math.log(m)));
-  return { lo, hi, gamma };
+  let low = 0;
+  let high = 0;
+  for (let v = 0; v < 10; v++) low += hist[v];
+  for (let v = 246; v < 256; v++) high += hist[v];
+  // 라플라시안 분산: 값이 작을수록 흐릿한 사진
+  let ls = 0;
+  let ls2 = 0;
+  let lc = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const p = y * w + x;
+      const v = 4 * gray[p] - gray[p - 1] - gray[p + 1] - gray[p - w] - gray[p + w];
+      ls += v;
+      ls2 += v * v;
+      lc++;
+    }
+  }
+  const lm = lc ? ls / lc : 0;
+  return {
+    mean: lum / n / 255,
+    p01: pct(0.01),
+    p05: pct(0.05),
+    p50: pct(0.5),
+    p95: pct(0.95),
+    p99: pct(0.99),
+    lowClip: low / n,
+    highClip: high / n,
+    chroma: chroma / n,
+    castRB: mid ? (sr - sb) / mid / 255 : 0,
+    castG: mid ? (sg - (sr + sb) / 2) / mid / 255 : 0,
+    mr: mid ? sr / mid / 255 : 0.5,
+    mg: mid ? sg / mid / 255 : 0.5,
+    mb: mid ? sb / mid / 255 : 0.5,
+    sharp: lc ? ls2 / lc - lm * lm : 0,
+  };
+}
+
+/**
+ * 64비트 차이 해시(dHash): 비슷한 사진 찾기용.
+ * 잔무늬에 흔들리지 않도록 72×64로 줄인 뒤 8×8 칸씩 평균을 내서 9×8 밝기 표를 만듭니다.
+ */
+export function dhash(source) {
+  const c = makeCanvas(72, 64);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(source, 0, 0, 72, 64);
+  const d = ctx.getImageData(0, 0, 72, 64).data;
+  const cell = new Float32Array(72);
+  for (let y = 0; y < 64; y++) {
+    for (let x = 0; x < 72; x++) {
+      const i = (y * 72 + x) * 4;
+      cell[((y >> 3) * 9) + ((x / 8) | 0)] += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+    }
+  }
+  let hex = '';
+  for (let y = 0; y < 8; y++) {
+    let byte = 0;
+    for (let x = 0; x < 8; x++) byte = (byte << 1) | (cell[y * 9 + x] > cell[y * 9 + x + 1] ? 1 : 0);
+    hex += byte.toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+export const STATS_VERSION = 3;
+
+/** 썸네일로 사진 상태를 측정합니다 (보정 추천·정리 도우미용). */
+export async function statsFromBlob(blob) {
+  const src = await decode(blob);
+  const [W, H] = dimsOf(src);
+  const k = 160 / Math.max(W, H);
+  const c = makeCanvas(W * k, H * k);
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(src, 0, 0, c.width, c.height);
+  const st = analyze(ctx.getImageData(0, 0, c.width, c.height));
+  st.ph = dhash(c);
+  st.v = STATS_VERSION;
+  src.close?.();
+  for (const key of Object.keys(st)) if (typeof st[key] === 'number') st[key] = Math.round(st[key] * 10000) / 10000;
+  return st;
+}
+
+export const SCENES = [
+  { id: 'auto', name: '자동', hint: '사진에 맞춰 알맞게' },
+  { id: 'portrait', name: '인물', hint: '부드러운 피부 톤' },
+  { id: 'landscape', name: '풍경', hint: '선명한 하늘과 초록' },
+  { id: 'food', name: '음식', hint: '따뜻하고 먹음직스럽게' },
+  { id: 'night', name: '야경', hint: '어두운 곳은 밝게, 불빛은 살리고' },
+  { id: 'hdr', name: 'HDR', hint: '밝은 곳과 어두운 곳을 모두 또렷하게' },
+  { id: 'document', name: '문서', hint: '종이는 하얗게, 글씨는 또렷하게' },
+];
+
+const ADJ_RANGE = Object.fromEntries(ADJUSTMENTS.map((a) => [a.key, [a.min, a.max]]));
+
+/**
+ * 측정값으로 '최적 보정' 값을 계산합니다. 결과는 조정 슬라이더 값이라 사용자가 그대로 더 다듬을 수 있어요.
+ * @param s analyze() 결과
+ * @param opts.strength 0~1.5 (1이 기본)
+ * @param opts.scene SCENES의 id
+ */
+export function autoAdjust(s, { strength = 1, scene = 'auto' } = {}) {
+  const adj = Object.fromEntries(ADJUSTMENTS.map((a) => [a.key, 0]));
+  const doc = scene === 'document';
+  // 1) 레벨: 가장 어두운 곳은 검게, 가장 밝은 곳은 희게
+  //    물 빠진 듯 밝게 뜬 사진은 검은 기준점을 더 과감하게 잡아요.
+  let lo = Math.max(0, Math.min(s.p05 > 0.3 ? 0.45 : 0.12, s.p01 - 0.01));
+  let hi = Math.max(0.55, Math.min(1, s.p99 + 0.01));
+  if (doc) {
+    lo = Math.min(0.35, s.p05);
+    hi = Math.max(0.55, Math.min(0.92, s.p50 + 0.12));
+  }
+  if (hi - lo < 0.2) {
+    lo = 0;
+    hi = 1;
+  }
+  const stretch = (v) => Math.min(1, Math.max(0, (v - lo) / (hi - lo)));
+  // 2) 중간 밝기: 원래 밝기를 존중하되, 너무 어두우면 밝게·너무 밝으면 조금 어둡게
+  const p50 = s.p50;
+  let desired = p50;
+  if (scene === 'night') desired = p50 < 0.3 ? p50 + (0.34 - p50) * 0.6 : p50;
+  else if (p50 < 0.38) desired = p50 + (0.42 - p50) * 0.7;
+  else if (p50 > 0.62) desired = 0.62 + (p50 - 0.62) * 0.6;
+  const mid = Math.min(0.97, Math.max(0.03, stretch(p50)));
+  desired = Math.min(0.95, Math.max(0.05, desired));
+  const gamma = Math.min(1.7, Math.max(0.55, Math.log(desired) / Math.log(mid)));
+  adj.brightness = Math.max(-60, Math.min(60, (gamma < 1 ? (1 / gamma - 1) / 0.9 : -(gamma - 1) / 0.9) * 100));
+  // 3) 그림자·하이라이트 살리기
+  adj.shadows = Math.min(45, Math.max(0, (s.lowClip - 0.04) * 260 + (stretch(s.p05) < 0.06 ? 8 : 0)));
+  adj.highlights = -Math.min(45, Math.max(0, (s.highClip - 0.03) * 260 + (stretch(s.p95) > 0.97 ? 8 : 0)));
+  // 4) 대비 (레벨로 이미 넓혔다면 조금만)
+  const spread = stretch(s.p95) - stretch(s.p05);
+  adj.contrast = spread < 0.6 ? Math.min(15, (0.6 - spread) * 45) : spread > 0.93 ? -6 : 0;
+  // 5) 화이트 밸런스: 중간 밝기 영역의 색 평균으로 채널별 게인을 계산.
+  //    자연스러운 범위(초록 숲, 파란 하늘 등)는 그대로 두고, 크게 치우친 만큼만 바로잡아요.
+  const castMag = Math.max(Math.abs(s.castRB), Math.abs(s.castG));
+  const k = doc ? 0.9 : scene === 'night' ? 0.15 * Math.min(1, castMag / 0.2) : 0.75 * Math.min(1, Math.max(0, (castMag - 0.07) / 0.2));
+  let wb = [1, 1, 1];
+  if (k > 0 && s.mr && s.mg && s.mb) {
+    const gray = (s.mr + s.mg + s.mb) / 3;
+    wb = [s.mr, s.mg, s.mb].map((m) => Math.min(1.6, Math.max(0.6, (gray / m) ** k)));
+  }
+  // 6) 색감: 색이 옅으면 생동감을 조금 더해요
+  //    (밝기 범위를 넓히면 색도 함께 진해지므로, 그만큼은 아래 auto.sat으로 덜어 냅니다)
+  const rel = s.chroma / Math.max(0.15, s.mean);
+  adj.vibrance = Math.min(18, Math.max(4, (0.3 - rel) * 80 + 4));
+  adj.clarity = 8;
+  adj.sharpness = 12;
+
+  const mods = {
+    portrait: { warmth: 6, clarity: -20, vibrance: -6, highlights: -8, sharpness: -12, brightness: 4 },
+    landscape: { vibrance: 18, clarity: 22, contrast: 8, highlights: -12, shadows: 8 },
+    food: { warmth: 10, vibrance: 18, brightness: 5, clarity: 8 },
+    night: { shadows: 28, highlights: -28, brightness: 6, vibrance: 8, sharpness: -6 },
+    hdr: { shadows: 38, highlights: -45, clarity: 32, vibrance: 12, contrast: -6 },
+    document: { contrast: 22, saturation: -55, sharpness: 38, clarity: 12, vibrance: -6, shadows: -10 },
+  }[scene];
+  if (mods) for (const [k, v] of Object.entries(mods)) adj[k] += v;
+
+  for (const k of Object.keys(adj)) {
+    const [mn, mx] = ADJ_RANGE[k];
+    adj[k] = Math.round(Math.max(mn, Math.min(mx, adj[k] * strength)));
+  }
+  const t = Math.min(1, strength);
+  const lo2 = lo * t;
+  const hi2 = 1 - (1 - hi) * t;
+  const g2 = 1 / (hi2 - lo2);
+  return {
+    auto: {
+      lo: lo2,
+      hi: hi2,
+      gamma: 1,
+      wb: wb.map((x) => 1 + (x - 1) * t),
+      sat: g2 > 1 ? (1 + (g2 - 1) * 0.35) / g2 : 1,
+    },
+    adj,
+  };
+}
+
+/* ---------- 디코딩 ---------- */
+
+export async function decode(blob) {
+  try {
+    return await createImageBitmap(blob, { imageOrientation: 'from-image' });
+  } catch {
+    const url = URL.createObjectURL(blob);
+    try {
+      const img = new Image();
+      img.src = url;
+      await img.decode();
+      return img;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+}
+
+export const dimsOf = (src) => [src.naturalWidth || src.width, src.naturalHeight || src.height];
+
+export function canvasToBlob(canvas, type) {
+  const png = type === 'image/png';
+  let c = canvas;
+  if (!png) {
+    c = makeCanvas(canvas.width, canvas.height);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(canvas, 0, 0);
+  }
+  return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('이미지를 만들지 못했어요'))), png ? 'image/png' : 'image/jpeg', 0.92));
+}
+
+/** 사진 한 장을 자동 보정한 새 파일을 만듭니다 (여러 장 한꺼번에 보정할 때 사용). */
+export async function autoEnhanceBlob(blob, type, opts) {
+  const src = await decode(blob);
+  try {
+    const [W, H] = dimsOf(src);
+    const k = Math.min(1, 320 / Math.max(W, H));
+    const probe = makeCanvas(W * k, H * k);
+    const pctx = probe.getContext('2d', { willReadFrequently: true });
+    pctx.drawImage(src, 0, 0, probe.width, probe.height);
+    const { auto, adj } = autoAdjust(analyze(pctx.getImageData(0, 0, probe.width, probe.height)), opts);
+    const st = { ...defaultState(), auto, adj };
+    return await canvasToBlob(renderFull(src, W, H, st), type);
+  } finally {
+    src.close?.();
+  }
+}
+
+/** 썸네일 크기 미리보기용 자동 보정 */
+export function previewEnhance(source, opts) {
+  const [W, H] = dimsOf(source);
+  const k = Math.min(1, 240 / Math.max(W, H));
+  const w = Math.max(1, Math.round(W * k));
+  const h = Math.max(1, Math.round(H * k));
+  const probe = makeCanvas(w, h);
+  const pctx = probe.getContext('2d', { willReadFrequently: true });
+  pctx.drawImage(source, 0, 0, w, h);
+  const { auto, adj } = autoAdjust(analyze(pctx.getImageData(0, 0, w, h)), opts);
+  return renderBase(probe, w, h, { ...defaultState(), auto, adj }, FULL, w, h, 1);
 }
 
 /* ---------- 그리기 · 모자이크 ---------- */
@@ -354,6 +689,7 @@ export function renderBase(src, W, H, st, region, outW, outH, outScale) {
   if (!isNeutral(st)) {
     const img = ctx.getImageData(0, 0, c.width, c.height);
     applyAdjust(img, st);
+    if (st.adj.clarity) clarity(img, st.adj.clarity / 100);
     if (st.adj.sharpness) sharpen(img, st.adj.sharpness / 100);
     ctx.putImageData(img, 0, 0);
   }

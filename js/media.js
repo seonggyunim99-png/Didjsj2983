@@ -323,3 +323,51 @@ export function makeVideoThumb(blob) {
     video.src = url;
   });
 }
+
+/**
+ * JPEG에서 위치(GPS) 정보만 지운 사본을 만듭니다. 사진 방향 등 나머지 정보는 그대로 둡니다.
+ * 위치 정보가 없거나 JPEG가 아니면 원래 파일을 그대로 돌려줘요.
+ */
+export async function stripGps(blob) {
+  try {
+    const head = new Uint8Array(await blob.slice(0, 256 * 1024).arrayBuffer());
+    const dv = new DataView(head.buffer);
+    if (dv.getUint16(0) !== 0xffd8) return blob;
+    let off = 2;
+    let tiff = -1;
+    while (off + 4 <= dv.byteLength) {
+      const marker = dv.getUint16(off);
+      if ((marker & 0xff00) !== 0xff00 || marker === 0xffda) break;
+      if (marker === 0xffe1 && dv.getUint32(off + 4) === 0x45786966) {
+        tiff = off + 10;
+        break;
+      }
+      off += 2 + dv.getUint16(off + 2);
+    }
+    if (tiff < 0) return blob;
+    const le = dv.getUint16(tiff) === 0x4949;
+    const u16 = (o) => dv.getUint16(tiff + o, le);
+    const u32 = (o) => dv.getUint32(tiff + o, le);
+    const ifd0 = u32(4);
+    let gpsOff = 0;
+    for (let i = 0, n = u16(ifd0); i < n; i++) {
+      const e = ifd0 + 2 + i * 12;
+      if (u16(e) === 0x8825) gpsOff = u32(e + 8);
+    }
+    if (!gpsOff || tiff + gpsOff + 2 > head.length) return blob;
+    const count = u16(gpsOff);
+    for (let i = 0; i < count; i++) {
+      const e = gpsOff + 2 + i * 12;
+      const size = ({ 1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8 }[u16(e + 2)] || 1) * u32(e + 4);
+      if (size > 4) {
+        const vo = tiff + u32(e + 8);
+        if (vo + size <= head.length) head.fill(0, vo, vo + size); // 좌표 값 자체도 지움
+      }
+      head.fill(0, tiff + e, tiff + e + 12);
+    }
+    dv.setUint16(tiff + gpsOff, 0, le); // 위치 항목 0개
+    return new Blob([head, blob.slice(head.length)], { type: blob.type });
+  } catch {
+    return blob;
+  }
+}

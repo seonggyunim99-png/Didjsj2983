@@ -4,6 +4,7 @@ import {
   detectType, kindOf, hashBlob, readExifDate, readVideoDate, makeImageThumb, makeVideoThumb, extOf,
 } from './media.js';
 import { buildZip, openZip, ZIP_MAX_ENTRY } from './zip.js';
+import { statsFromBlob, STATS_VERSION } from './imaging.js';
 
 export const TRASH_DAYS = 30;
 const DAY = 864e5;
@@ -54,9 +55,14 @@ export async function load() {
 
 /* ---------- 조회 ---------- */
 
+/** 휴지통이 아닌 모든 항목 (숨긴 항목 포함 — 백업용) */
 export const activeMedia = () => store.media.filter((m) => !m.deletedAt);
+/** 화면에 보여줄 항목 (숨긴 항목 제외) */
+export const visibleMedia = () => store.media.filter((m) => !m.deletedAt && !m.hidden);
+export const hiddenMedia = () => store.media.filter((m) => !m.deletedAt && m.hidden);
 export const trashedMedia = () => store.media.filter((m) => m.deletedAt).sort((a, b) => b.deletedAt - a.deletedAt);
-export const albumMedia = (albumId) => activeMedia().filter((m) => m.albums.includes(albumId));
+export const albumMedia = (albumId) => visibleMedia().filter((m) => m.albums.includes(albumId));
+export const isScreenshot = (m) => /screenshot|스크린샷|screen_?shot|캡처|capture/i.test(m.name);
 export const getAlbum = (id) => store.albums.find((a) => a.id === id) || null;
 export const getOriginal = (id) => db.getBlob(id);
 
@@ -164,6 +170,7 @@ export async function importFiles(items, onProgress, shouldStop = () => false) {
         takenAt,
         addedAt: now,
         favorite: !!it.favorite,
+        hidden: !!it.hidden,
         albums: [...new Set(albumIds)],
         deletedAt: null,
         exportedAt: it.fromBackup ? now : null,
@@ -272,6 +279,7 @@ export async function saveEdit(id, blob, { asCopy = false } = {}) {
       exportedAt: null,
       thumb: info.thumb,
       editedAt: now,
+      copyOf: m.copyOf || m.id, // 원본과 그 사본은 '비슷한 사진'으로 묶지 않음
     };
     await db.addMedia(rec, blob);
     store.media.push(rec);
@@ -297,6 +305,7 @@ export async function saveEdit(id, blob, { asCopy = false } = {}) {
     edited: true,
     editedAt: now,
     exportedAt: null,
+    stats: null,
   });
   await db.putMedia(m);
   emit();
@@ -326,6 +335,7 @@ export async function revertEdit(id) {
     editedAt: null,
     exportedAt: null,
     originalSize: 0,
+    stats: null,
   });
   delete m.originalType;
   delete m.originalName;
@@ -358,6 +368,135 @@ export async function setAlbumCover(albumId, mediaId) {
 /** 모든 데이터를 지웁니다 (되돌릴 수 없음). */
 export async function wipeAll() {
   await db.destroyAll();
+}
+
+/* ---------- 숨긴 항목 ---------- */
+
+export async function setHidden(ids, value) {
+  const list = records(ids);
+  list.forEach((m) => { m.hidden = value; });
+  await db.putMedia(list);
+  emit();
+}
+
+/* ---------- 사진 분석 (보정 추천 · 정리 도우미) ---------- */
+
+export const analysis = { running: false, done: 0, total: 0 };
+let analysisRun = null;
+
+const needsStats = (m) => m.kind === 'image' && m.thumb && !m.deletedAt && (!m.stats || m.stats.v !== STATS_VERSION);
+
+/** 아직 분석하지 않은 사진을 조금씩 분석합니다. onTick(analysis)로 진행 상황을 알려줘요. */
+export function ensureStats(onTick) {
+  if (analysisRun) return analysisRun;
+  const todo = store.media.filter(needsStats);
+  if (!todo.length) return Promise.resolve(false);
+  Object.assign(analysis, { running: true, done: 0, total: todo.length });
+  analysisRun = (async () => {
+    let pending = [];
+    for (const m of todo) {
+      try {
+        if (needsStats(m)) {
+          m.stats = await statsFromBlob(m.thumb);
+          pending.push(m);
+        }
+      } catch {
+        m.stats = { v: STATS_VERSION, failed: true };
+      }
+      analysis.done++;
+      if (pending.length >= 25) {
+        await db.putMedia(pending);
+        pending = [];
+        onTick?.(analysis);
+      }
+      // 화면이 멈추지 않게 조금씩 쉬어 갑니다
+      if (analysis.done % 8 === 0) await new Promise((r) => setTimeout(r, 0));
+    }
+    if (pending.length) await db.putMedia(pending);
+    analysis.running = false;
+    analysisRun = null;
+    onTick?.(analysis);
+    emit();
+    return true;
+  })();
+  return analysisRun;
+}
+
+const goodStats = (m) => m.kind === 'image' && m.stats && !m.stats.failed && m.stats.v === STATS_VERSION;
+
+/** 보정하면 좋아질 사진 묶음 */
+export function enhanceSuggestions() {
+  const cats = { dark: [], bright: [], flat: [], cast: [] };
+  for (const m of visibleMedia()) {
+    if (!goodStats(m) || m.edited || m.copyOf || isScreenshot(m) || m.type === 'image/png') continue;
+    const s = m.stats;
+    if (s.p50 < 0.3 && s.mean < 0.34) cats.dark.push(m);
+    else if (s.p50 > 0.82 || s.highClip > 0.3) cats.bright.push(m);
+    else if (s.p95 - s.p05 < 0.3 && s.p05 > 0.18) cats.flat.push(m); // 검은 부분이 들뜨고 대비가 약한 뿌연 사진
+    else if ((Math.abs(s.castRB) > 0.18 || Math.abs(s.castG) > 0.15) && s.chroma < 0.5) cats.cast.push(m);
+  }
+  return cats;
+}
+
+/** 선명함을 대비로 나눠서, 대비가 낮을 뿐인 사진과 정말 흐린 사진을 구분합니다. */
+const focus = (s) => s.sharp / Math.max(0.05, s.p95 - s.p05) ** 2;
+const BLUR_LIMIT = 400;
+export const blurryMedia = () => visibleMedia()
+  .filter((m) => goodStats(m) && !isScreenshot(m) && m.stats.p95 - m.stats.p05 > 0.15 && focus(m.stats) < BLUR_LIMIT)
+  .sort((a, b) => focus(a.stats) - focus(b.stats));
+export const screenshotMedia = () => visibleMedia().filter(isScreenshot);
+export const LARGE_VIDEO = 50 * 1024 * 1024;
+export const largeVideos = () => visibleMedia().filter((m) => m.kind === 'video' && m.size >= LARGE_VIDEO).sort((a, b) => b.size - a.size);
+
+function hamming(a, b) {
+  let d = 0;
+  for (let i = 0; i < 16; i += 8) {
+    let x = (parseInt(a.slice(i, i + 8), 16) ^ parseInt(b.slice(i, i + 8), 16)) >>> 0;
+    while (x) {
+      x &= x - 1;
+      d++;
+    }
+  }
+  return d;
+}
+
+/**
+ * 비슷한 사진 묶음. 가까운 시간(2시간 안)에 찍었고 모양이 거의 같은 사진끼리 묶어요.
+ * (연속 촬영처럼 1분 안에 찍은 사진은 기준을 조금 넉넉하게)
+ * 각 묶음의 첫 번째가 가장 선명하고 큰 '추천 보관' 사진입니다.
+ */
+export function similarGroups() {
+  const list = visibleMedia().filter((m) => goodStats(m) && m.stats.ph).sort((a, b) => a.takenAt - b.takenAt);
+  const parent = list.map((_, i) => i);
+  const find = (i) => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  };
+  const WINDOW = 2 * 3600e3;
+  for (let i = 0; i < list.length; i++) {
+    for (let j = i + 1; j < list.length && list[j].takenAt - list[i].takenAt <= WINDOW; j++) {
+      // 1분 안에 연달아 찍은 사진은 조금 더 너그럽게, 그 외에는 거의 같은 사진만 묶음
+      const a = list[i];
+      const b = list[j];
+      if (a.copyOf === b.id || b.copyOf === a.id || (a.copyOf && a.copyOf === b.copyOf)) continue; // 직접 만든 사본
+      const limit = b.takenAt - a.takenAt <= 60e3 ? 12 : 6;
+      if (hamming(a.stats.ph, b.stats.ph) <= limit) parent[find(j)] = find(i);
+    }
+  }
+  const groups = new Map();
+  list.forEach((m, i) => {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(m);
+  });
+  const score = (m) => m.stats.sharp * Math.sqrt((m.width * m.height) || 1) + (m.favorite ? 1e12 : 0);
+  return [...groups.values()]
+    .filter((g) => g.length > 1)
+    .map((g) => g.sort((a, b) => score(b) - score(a)))
+    .sort((a, b) => b[0].takenAt - a[0].takenAt);
 }
 
 /* ---------- 앨범 ---------- */
@@ -485,6 +624,7 @@ export async function buildArchive(items, { withManifest = true, part = 1, parts
       takenAt: m.takenAt,
       addedAt: m.addedAt,
       favorite: !!m.favorite,
+      hidden: !!m.hidden,
       albums: m.albums.map((id) => getAlbum(id)?.name).filter(Boolean),
       hash: m.hash,
     });
@@ -549,6 +689,7 @@ export async function readBackupFiles(files) {
           lastModified: entry.mtime,
           takenAt: info?.takenAt || null,
           favorite: !!info?.favorite,
+          hidden: !!info?.hidden,
           albumNames: Array.isArray(info?.albums) ? info.albums : [],
           fromBackup: !!info,
           load: () => zip.getBlob(entry, type),
