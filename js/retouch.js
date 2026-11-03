@@ -8,7 +8,7 @@ export const LIQ_TOOLS = [
   ['push', '밀기'],
   ['bloat', '크게'],
   ['pinch', '작게'],
-  ['restore', '되돌리기'],
+  ['restore', '지우개'],
 ];
 
 // 부분 보정 도구: [밝기, 채도, 색온도, 디테일] 방향
@@ -25,6 +25,9 @@ export const LOCAL_TOOLS = [
   ['erase', '지우개', null],
 ];
 const LOCAL_VEC = Object.fromEntries(LOCAL_TOOLS.map(([k, , v]) => [k, v]));
+// 보정 지우개: 'fx' 지우기(첫 채널을 올림) · 'unfx' 되살리기(지운 것을 덜어냄)
+LOCAL_VEC.fx = [1, 0, 0, 0];
+LOCAL_VEC.unfx = null;
 
 const smooth = (t) => {
   const u = 1 - t * t;
@@ -262,6 +265,13 @@ export class LocalMask {
     const r = this.rows;
     this.rows = null;
     return r;
+  }
+
+  /** 단위 좌표에서 첫 채널 값 (보정 지우개 정도) */
+  value(x, y) {
+    const gx = Math.min(this.fw - 1, Math.max(0, Math.floor(x / this.cs)));
+    const gy = Math.min(this.fh - 1, Math.max(0, Math.floor(y / this.cs)));
+    return this.v[(gy * this.fw + gx) * 4];
   }
 }
 

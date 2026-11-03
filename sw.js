@@ -1,5 +1,5 @@
 // 서비스 워커: 오프라인 실행 + 다른 앱에서 '공유'로 보낸 사진 받기
-const VERSION = 'v3.3.0';
+const VERSION = 'v3.4.0';
 const CACHE = `photo-vault-${VERSION}`;
 const SHELL = [
   './',

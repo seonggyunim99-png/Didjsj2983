@@ -604,7 +604,7 @@ export async function decode(blob) {
 
 export const dimsOf = (src) => [src.naturalWidth || src.width, src.naturalHeight || src.height];
 
-export function canvasToBlob(canvas, type) {
+export function canvasToBlob(canvas, type, quality = 0.95) {
   const png = type === 'image/png';
   let c = canvas;
   if (!png) {
@@ -614,7 +614,7 @@ export function canvasToBlob(canvas, type) {
     ctx.fillRect(0, 0, c.width, c.height);
     ctx.drawImage(canvas, 0, 0);
   }
-  return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('이미지를 만들지 못했어요'))), png ? 'image/png' : 'image/jpeg', 0.92));
+  return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('이미지를 만들지 못했어요'))), png ? 'image/png' : 'image/jpeg', quality));
 }
 
 /** 사진 한 장을 자동 보정한 새 파일을 만듭니다 (여러 장 한꺼번에 보정할 때 사용). */

@@ -70,6 +70,7 @@ export function defaultState() {
     strokes: [],
     liquify: [], // 손으로 모양 다듬기 획 (retouch.js)
     local: [], // 부분 보정 브러시 획
+    erase: [], // 보정 지우개 획 (화면 자리 기준)
   };
 }
 

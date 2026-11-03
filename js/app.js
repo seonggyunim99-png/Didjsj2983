@@ -16,7 +16,7 @@ import { reviewEnhance, runBatchEnhance, STRENGTHS } from './enhance.js';
 import { openCollage } from './collage.js';
 import { canvasToBlob } from './imaging.js';
 
-const APP_VERSION = '3.3.0';
+const APP_VERSION = '3.4.0';
 
 const $ = (s, root = document) => root.querySelector(s);
 const appbar = $('#appbar');

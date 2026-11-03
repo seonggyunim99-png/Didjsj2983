@@ -87,36 +87,51 @@ export function buildWarps(faces, adj, W, H, max = 40) {
     b.set([vx, vy, s, 0], n * 4);
     n++;
   };
+  // 겹치는 밀기 여러 개를 합쳐도 목표 거리만큼만 움직이도록 크기를 맞춤
+  const group = (list, target) => {
+    const k = (i, j) => {
+      const t = len(sub(list[i].c, list[j].c)) / list[j].r;
+      return t < 1 ? (1 - t * t) ** 2 : 0;
+    };
+    let sum = 0;
+    list.forEach((_, i) => list.forEach((__, j) => { sum += k(i, j); }));
+    const f = target / Math.max(1, sum / list.length);
+    for (const g of list) push(g.c[0], g.c[1], g.r, 1, g.v[0] * f, g.v[1] * f, 0);
+  };
   for (const face of faces || []) {
     const P = toUnit(face, W, H);
     const g = geometry(P);
-    // 눈 크게: 눈동자 중심을 기준으로 살짝 확대
+    // 눈 크게: 눈동자 중심 기준, 최대 약 8% 확대 (앱 기본값 수준은 2~4%)
     if (adj.eyes > 0) {
       for (const [eye, pts] of [[P[468] || g.eyeR, EYE_R], [P[473] || g.eyeL, EYE_L]]) {
         const w = len(sub(P[pts[0]], P[pts[8]]));
-        push(eye[0], eye[1], w * 1.1, 0, 0, 0, (adj.eyes / 100) * 0.2);
+        push(eye[0], eye[1], w * 1.05, 0, 0, 0, (adj.eyes / 100) * 0.09);
       }
     }
-    // 얼굴 갸름하게: 볼~턱선을 얼굴 안쪽으로
+    // 얼굴 갸름하게: 볼 아래~턱선만 안쪽으로, 최대 한쪽 3.5% (광대·이마는 그대로)
+    // 중심을 얼굴 안쪽으로 조금 옮겨서 배경이 덜 휘게 함
     if (adj.faceSlim > 0) {
-      const amt = (adj.faceSlim / 100) * g.faceW * 0.05;
-      for (const i of [...JAW_R, ...JAW_L]) {
-        const v = mul(norm(sub(g.center, P[i])), amt);
-        push(P[i][0], P[i][1], g.faceW * 0.24, 1, v[0], v[1], 0);
+      for (const side of [JAW_R, JAW_L]) {
+        const list = side.map((i) => {
+          const dir = norm(sub(g.center, P[i]));
+          return { c: add(P[i], mul(dir, g.faceW * 0.05)), r: g.faceW * 0.2, v: dir };
+        });
+        group(list, (adj.faceSlim / 100) * g.faceW * 0.035);
       }
     }
-    // 턱 길이: 턱끝을 얼굴 아래 방향으로 늘리거나 줄이기
+    // 턱 길이: 턱끝만 위아래로, 최대 얼굴 길이의 2.5% (입은 거의 움직이지 않게 반지름을 작게)
     if (adj.chin) {
-      const v = mul(g.down, (adj.chin / 100) * g.faceH * 0.04);
-      push(P[152][0], P[152][1], g.faceW * 0.3, 1, v[0], v[1], 0);
+      const v = mul(g.down, (adj.chin / 100) * g.faceH * 0.025);
+      const c = add(P[152], mul(g.down, -g.faceH * 0.02));
+      push(c[0], c[1], g.faceW * 0.2, 1, v[0], v[1], 0);
     }
-    // 코 슬림: 콧방울을 코 중심 쪽으로
+    // 코 슬림: 콧방울을 안쪽으로, 최대 코 폭의 6%
     if (adj.nose > 0) {
       const tip = P[4];
       const nw = len(sub(P[358], P[129]));
-      for (const i of [129, 358, 98, 327]) {
-        const v = mul(norm(sub(tip, P[i])), (adj.nose / 100) * nw * 0.12);
-        push(P[i][0], P[i][1], nw * 0.45, 1, v[0], v[1], 0);
+      for (const side of [[129, 98], [358, 327]]) {
+        const list = side.map((i) => ({ c: P[i], r: nw * 0.4, v: norm(sub(tip, P[i])) }));
+        group(list, (adj.nose / 100) * nw * 0.06);
       }
     }
   }
@@ -264,5 +279,5 @@ export function buildMasks(faces, W, H) {
 
 /** 자동 뷰티: 티 나지 않게 자연스러운 정도 */
 export const AUTO_BEAUTY = {
-  skinSmooth: 45, skinTone: 28, darkCircle: 35, blush: 12, faceSlim: 22, eyes: 14, eyeBright: 25, nose: 12, lips: 20, teeth: 30,
+  skinSmooth: 40, skinTone: 25, darkCircle: 35, blush: 20, faceSlim: 30, eyes: 25, eyeBright: 25, nose: 20, lips: 30, teeth: 35,
 };

@@ -119,6 +119,8 @@ export class Editor {
     // 성형(손으로 모양 다듬기) · 부분 보정 브러시
     this.liq = { tool: 'push', size: 40, strength: 60 };
     this.lc = { tool: 'light', size: 24, strength: 40 };
+    this.er = { tool: 'fx', size: 26, strength: 100 }; // 보정 지우개
+    this.eraseMode = false;
     this.showLocal = false;
     this.op = null;
     this.faces = undefined; // undefined 아직 · null 찾는 중 실패 · [] 없음 · [...] 찾음
@@ -624,16 +626,28 @@ export class Editor {
           <button type="button" class="ed-chip" data-act="reset-beauty">${icon('restore')}초기화</button>
         </div>
         <p class="ed-face-status${fs === 'busy' ? ' busy' : ''}" aria-live="polite">${esc(status)}</p>
-        <div class="ed-group-body">
-          ${rows.map((a) => (a.face && !n ? this.adjRow(a).replace('<input', '<input disabled').replace('ed-slider-row', 'ed-slider-row disabled') : this.adjRow(a))).join('')}
-          ${this.bgroup === 'skin' ? `
-          <div class="ed-chips">
-            <button type="button" class="ed-chip${this.healMode ? ' on' : ''}" data-act="heal-toggle">${icon('healing')}잡티 제거 브러시</button>
-            <button type="button" class="ed-chip" data-act="undo-heal"${st.heals.length ? '' : ' disabled'}>${icon('undo')}잡티 하나 되돌리기</button>
-          </div>
-          ${this.healMode ? this.sliderRow({ attrs: 'data-slider="healSize"', label: '브러시 크기', value: this.healSize, min: 4, max: 40, text: `${this.healSize}`, reset: false }) : ''}` : ''}
+        <div class="ed-chips">
+          <button type="button" class="ed-chip${this.healMode ? ' on' : ''}" data-act="heal-toggle" aria-pressed="${this.healMode}">${icon('healing')}잡티 제거</button>
+          <button type="button" class="ed-chip${this.eraseMode ? ' on' : ''}" data-act="erase-toggle" aria-pressed="${this.eraseMode}">${icon('erase')}보정 지우개</button>
         </div>
-        <p class="ed-hint">${this.healMode ? '사진을 확대한 뒤 잡티·여드름·점을 톡 누르거나 문지르세요. 주변 피부로 자연스럽게 메워요.' : '얼굴을 찾아 피부·눈·코·입·얼굴형을 자연스럽게 다듬어요. 사진은 기기 밖으로 나가지 않아요.'}</p>`;
+        <div class="ed-group-body">
+          ${this.healMode ? `
+            ${this.sliderRow({ attrs: 'data-slider="healSize"', label: '브러시 크기', value: this.healSize, min: 4, max: 40, text: `${this.healSize}`, reset: false })}
+            <div class="ed-chips"><button type="button" class="ed-chip" data-act="undo-heal"${st.heals.length ? '' : ' disabled'}>${icon('undo')}잡티 하나 되돌리기</button></div>`
+    : this.eraseMode ? `
+            <div class="ed-chips">
+              <button type="button" class="ed-chip${this.er.tool === 'fx' ? ' on' : ''}" data-er-tool="fx">지우기</button>
+              <button type="button" class="ed-chip${this.er.tool === 'unfx' ? ' on' : ''}" data-er-tool="unfx">되살리기</button>
+              <button type="button" class="ed-chip" data-act="undo-erase"${st.erase.length ? '' : ' disabled'}>${icon('undo')}한 획 되돌리기</button>
+              <button type="button" class="ed-chip" data-act="clear-erase"${st.erase.length ? '' : ' disabled'}>${icon('restore')}모두 되살리기</button>
+            </div>
+            ${this.sliderRow({ attrs: 'data-slider="erSize"', label: '브러시 크기', value: this.er.size, min: 4, max: 100, text: `${this.er.size}`, reset: false })}
+            ${this.sliderRow({ attrs: 'data-slider="erStrength"', label: '세기', value: this.er.strength, min: 10, max: 100, text: `${this.er.strength}`, reset: false })}`
+      : rows.map((a) => (a.face && !n ? this.adjRow(a).replace('<input', '<input disabled').replace('ed-slider-row', 'ed-slider-row disabled') : this.adjRow(a))).join('')}
+        </div>
+        <p class="ed-hint">${this.healMode ? '사진을 확대한 뒤 잡티·여드름·점을 톡 누르거나 문지르세요. 주변 피부로 자연스럽게 메워요.'
+    : this.eraseMode ? (this.er.tool === 'fx' ? '문지른 곳은 얼굴형·피부·입술 등 인물 보정과 성형·부분 보정이 빠지고 원래 모습으로 돌아가요. (밝기·색감·필터는 그대로)' : '지웠던 곳을 문지르면 보정이 다시 살아나요.')
+      : '얼굴을 찾아 피부·눈·코·입·얼굴형을 자연스럽게 다듬어요. 사진은 기기 밖으로 나가지 않아요.'}</p>`;
     } else if (this.tab === 'reshape') {
       const L = this.liq;
       html = `
@@ -982,6 +996,11 @@ export class Editor {
         this.liq[r.dataset.slider === 'liqSize' ? 'size' : 'strength'] = v;
         out.textContent = `${v}`;
         break;
+      case 'erSize':
+      case 'erStrength':
+        this.er[r.dataset.slider === 'erSize' ? 'size' : 'strength'] = v;
+        out.textContent = `${v}`;
+        break;
       case 'lcSize':
       case 'lcStrength':
         this.lc[r.dataset.slider === 'lcSize' ? 'size' : 'strength'] = v;
@@ -997,7 +1016,10 @@ export class Editor {
     if (tab) {
       if (this.tab !== tab.dataset.tab) {
         this.tab = tab.dataset.tab;
-        if (this.tab !== 'beauty') this.healMode = false;
+        if (this.tab !== 'beauty') {
+          this.healMode = false;
+          this.eraseMode = false;
+        }
         else this.ensureFaces();
         if (this.tab !== 'local' && this.showLocal) {
           this.showLocal = false;
@@ -1054,6 +1076,11 @@ export class Editor {
       this.renderPanel();
       return;
     }
+    if ((el = pick('[data-er-tool]'))) {
+      this.er.tool = el.dataset.erTool;
+      this.renderPanel();
+      return;
+    }
     if ((el = pick('[data-lc-tool]'))) {
       this.lc.tool = el.dataset.lcTool;
       this.renderPanel();
@@ -1061,7 +1088,8 @@ export class Editor {
     }
     if ((el = pick('[data-bgroup]'))) {
       this.bgroup = el.dataset.bgroup;
-      if (this.bgroup !== 'skin') this.healMode = false;
+      this.healMode = false;
+      this.eraseMode = false;
       this.renderPanel();
       return;
     }
@@ -1202,7 +1230,27 @@ export class Editor {
         this.renderPanel();
         this.invalidate();
         break;
+      case 'erase-toggle':
+        this.eraseMode = !this.eraseMode;
+        this.er.tool = 'fx'; // 켤 때는 항상 '지우기'부터
+        this.healMode = false;
+        this.ringEl.hidden = true;
+        this.renderPanel();
+        break;
+      case 'undo-erase':
+        st.erase.pop();
+        this.commit();
+        this.renderPanel();
+        this.invalidate();
+        break;
+      case 'clear-erase':
+        st.erase.length = 0;
+        this.commit();
+        this.renderPanel();
+        this.invalidate();
+        break;
       case 'heal-toggle':
+        this.eraseMode = false;
         this.healMode = !this.healMode;
         this.renderPanel();
         break;
@@ -1394,7 +1442,7 @@ export class Editor {
         this.healAt(nx, ny);
         return;
       }
-      if (this.tab === 'reshape' || this.tab === 'local') {
+      if (this.brushTab()) {
         e.preventDefault();
         c.setPointerCapture(e.pointerId);
         this.startOp(e);
@@ -1412,7 +1460,7 @@ export class Editor {
       this.requestPaint();
     });
     c.addEventListener('pointermove', (e) => {
-      if (this.tab === 'reshape' || this.tab === 'local') {
+      if (this.brushTab()) {
         this.moveRing(e);
         if (this.op) this.moveOp(e);
         return;
@@ -1462,7 +1510,19 @@ export class Editor {
 
   /** 사진 위를 문지르는 탭인지 (이때는 한 손가락으로 이동하지 않음) */
   paintTab() {
-    return this.tab === 'draw' || this.tab === 'reshape' || this.tab === 'local' || (this.tab === 'beauty' && this.healMode);
+    return this.tab === 'draw' || this.brushTab() || (this.tab === 'beauty' && this.healMode);
+  }
+
+  /** 성형 · 부분 · 보정 지우개처럼 문질러서 획을 남기는 상태인지 */
+  brushTab() {
+    return this.tab === 'reshape' || this.tab === 'local' || (this.tab === 'beauty' && this.eraseMode);
+  }
+
+  /** 지금 브러시 설정 · 획 목록 · 실제 원본 자리로 옮길지(부분 보정만) */
+  brushMode() {
+    if (this.tab === 'reshape') return { cfg: this.liq, list: this.st.liquify, warp: false, hold: this.liq.tool !== 'push' };
+    if (this.tab === 'local') return { cfg: this.lc, list: this.st.local, warp: true, hold: false };
+    return { cfg: this.er, list: this.st.erase, warp: false, hold: false };
   }
 
   /** 원본 비율 좌표 → 긴 변 = 1 단위 */
@@ -1472,13 +1532,13 @@ export class Editor {
   }
 
   brushRadius() {
-    const size = this.tab === 'reshape' ? this.liq.size : this.lc.size;
+    const size = this.brushMode().cfg.size;
     return this.visibleToSource(size) / Math.max(this.Ww, this.Hw);
   }
 
   moveRing(e) {
     const rect = this.stage.getBoundingClientRect();
-    const size = this.tab === 'reshape' ? this.liq.size : this.lc.size;
+    const size = this.brushMode().cfg.size;
     // visibleToSource와 같은 기준: 화면 캔버스 픽셀 → CSS 픽셀
     const cr = this.canvas.getBoundingClientRect();
     const d = 2 * ((size / 400) * Math.max(this.canvas.width, this.canvas.height) / this.zoom) * (cr.width / this.canvas.width);
@@ -1494,19 +1554,18 @@ export class Editor {
   /** 성형은 보이는 화면 좌표 그대로, 부분 보정은 실제 원본 자리(변형 반영)로 */
   opPoint(e) {
     const p = this.toSource(e);
-    return this.toUnit(this.tab === 'local' ? this.renderer.warpPoint(...p) : p);
+    return this.toUnit(this.brushMode().warp ? this.renderer.warpPoint(...p) : p);
   }
 
   startOp(e) {
-    const local = this.tab === 'local';
-    const cfg = local ? this.lc : this.liq;
+    const { cfg, list, hold } = this.brushMode();
     const [x, y] = this.opPoint(e);
     this.op = { t: cfg.tool, r: Math.round(this.brushRadius() * 1e5) / 1e5, s: cfg.strength / 100, p: [x, y] };
-    this.opList = local ? this.st.local : this.st.liquify;
+    this.opList = list;
     this.opList.push(this.op);
     this.moveRing(e);
-    // 크게 · 작게 · 되돌리기: 누르고 있는 동안 계속 적용
-    if (!local && this.op.t !== 'push') {
+    // 크게 · 작게 · 지우개(성형): 누르고 있는 동안 계속 적용
+    if (hold) {
       this.opHold = setInterval(() => {
         if (!this.op) return;
         const p = this.op.p;
