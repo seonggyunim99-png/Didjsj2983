@@ -15,29 +15,53 @@ const BROW_L = [276, 283, 282, 295, 285, 336, 296, 334, 293, 300];
 const JAW_R = [132, 58, 172, 136, 150, 149];
 const JAW_L = [361, 288, 397, 365, 379, 378];
 
-let loading = null;
+let vision = null;
+const tasks = {};
 
-/** 얼굴 인식기를 한 번만 불러옵니다 (약 20MB, 처음 한 번만 내려받고 이후에는 저장된 것을 씀). */
-function landmarker() {
-  if (!loading) {
-    loading = (async () => {
-      const { FaceLandmarker, FilesetResolver } = await import(`${VENDOR}vision_bundle.mjs`);
-      const fileset = await FilesetResolver.forVisionTasks(`${VENDOR}wasm`);
-      return FaceLandmarker.createFromOptions(fileset, {
-        baseOptions: { modelAssetPath: `${VENDOR}face_landmarker.task`, delegate: 'CPU' },
-        runningMode: 'IMAGE',
-        numFaces: 6,
-      });
+function visionBase() {
+  if (!vision) {
+    vision = (async () => {
+      const mod = await import(`${VENDOR}vision_bundle.mjs`);
+      const fileset = await mod.FilesetResolver.forVisionTasks(`${VENDOR}wasm`);
+      return { mod, fileset };
     })().catch((err) => {
-      loading = null;
+      vision = null;
       throw err;
     });
   }
-  return loading;
+  return vision;
 }
 
+/** 인식기를 한 번만 불러옵니다 (처음 한 번만 내려받고 이후에는 저장된 것을 씀) */
+function task(name, make) {
+  if (!tasks[name]) {
+    tasks[name] = visionBase().then(({ mod, fileset }) => make(mod, fileset)).catch((err) => {
+      delete tasks[name];
+      throw err;
+    });
+  }
+  return tasks[name];
+}
+
+const landmarker = () => task('face', (m, fs) => m.FaceLandmarker.createFromOptions(fs, {
+  baseOptions: { modelAssetPath: `${VENDOR}face_landmarker.task`, delegate: 'CPU' },
+  runningMode: 'IMAGE',
+  numFaces: 6,
+}));
+const poser = () => task('pose', (m, fs) => m.PoseLandmarker.createFromOptions(fs, {
+  baseOptions: { modelAssetPath: `${VENDOR}pose_landmarker_lite.task`, delegate: 'CPU' },
+  runningMode: 'IMAGE',
+  numPoses: 4,
+}));
+const segmenter = () => task('seg', (m, fs) => m.ImageSegmenter.createFromOptions(fs, {
+  baseOptions: { modelAssetPath: `${VENDOR}selfie_multiclass_256x256.tflite`, delegate: 'CPU' },
+  runningMode: 'IMAGE',
+  outputCategoryMask: false,
+  outputConfidenceMasks: true,
+}));
+
 /**
- * 사진 속 얼굴들의 주요 지점을 찾습니다.
+ * 사진 속 얼굴들의 주요 지점을 찾습니다. 왼쪽 얼굴부터 1번, 2번… 순서
  * @returns {Promise<number[][][]>} 얼굴마다 [x, y] (0~1 비율) 478개
  */
 export async function detectFaces(source) {
@@ -45,7 +69,129 @@ export async function detectFaces(source) {
   const res = lm.detect(source);
   return (res.faceLandmarks || [])
     .filter((f) => f.length >= 468)
-    .map((f) => f.map((p) => [p.x, p.y]));
+    .map((f) => f.map((p) => [p.x, p.y]))
+    .sort((a, b) => a[1][0] - b[1][0]);
+}
+
+/**
+ * 사람 몸의 주요 지점 (어깨·골반·무릎·발목 등 33개)
+ * @returns {Promise<number[][][]>} 사람마다 [x, y, 보이는 정도]
+ */
+export async function detectPoses(source) {
+  const lm = await poser();
+  const res = lm.detect(source);
+  return (res.landmarks || []).map((pts) => pts.map((p) => [p.x, p.y, p.visibility ?? 1]));
+}
+
+/**
+ * 사람 영역 (배경 흐림용). 256px 결과를 사진 경계에 맞춰 다듬어 돌려줍니다.
+ * @returns {Promise<{w:number, h:number, data:Uint8Array}|null>} 0 배경 ~ 255 사람
+ */
+export async function segmentPerson(source, W, H) {
+  const sg = await segmenter();
+  const res = sg.segment(source);
+  const masks = res.confidenceMasks || [];
+  if (!masks.length) return null;
+  const bgMask = masks[0];
+  const mw = bgMask.width;
+  const mh = bgMask.height;
+  const bgv = bgMask.getAsFloat32Array();
+  const person = new Float32Array(mw * mh);
+  let any = 0;
+  for (let i = 0; i < person.length; i++) {
+    person[i] = 1 - bgv[i];
+    any += person[i] > 0.5 ? 1 : 0;
+  }
+  masks.forEach((m) => m.close());
+  res.close?.();
+  if (any < person.length * 0.005) return null;
+  // 사진 경계(머리카락 등)에 맞춰 다듬기: 가이드 필터
+  const k = Math.min(1, 768 / Math.max(W, H));
+  const w = Math.max(8, Math.round(W * k));
+  const h = Math.max(8, Math.round(H * k));
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(source, 0, 0, w, h);
+  const img = ctx.getImageData(0, 0, w, h).data;
+  const I = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) I[i] = (0.299 * img[i * 4] + 0.587 * img[i * 4 + 1] + 0.114 * img[i * 4 + 2]) / 255;
+  const P = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const fy = Math.min(mh - 1.001, Math.max(0, ((y + 0.5) / h) * mh - 0.5));
+    const y0 = Math.floor(fy);
+    const ty = fy - y0;
+    for (let x = 0; x < w; x++) {
+      const fx = Math.min(mw - 1.001, Math.max(0, ((x + 0.5) / w) * mw - 0.5));
+      const x0 = Math.floor(fx);
+      const tx = fx - x0;
+      const i0 = y0 * mw + x0;
+      const a = person[i0] + (person[i0 + 1] - person[i0]) * tx;
+      const b2 = person[i0 + mw] + (person[i0 + mw + 1] - person[i0 + mw]) * tx;
+      P[y * w + x] = a + (b2 - a) * ty;
+    }
+  }
+  const q = guidedFilter(I, P, w, h, Math.max(2, Math.round(Math.max(w, h) / 90)), 0.002);
+  const data = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    // 경계를 조금 또렷하게
+    const v = Math.min(1, Math.max(0, (q[i] - 0.5) * 1.6 + 0.5));
+    data[i] = Math.round(v * 255);
+  }
+  return { w, h, data };
+}
+
+function boxFilter(src, w, h, r) {
+  const out = new Float32Array(w * h);
+  const tmp = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    let s = 0;
+    const o = y * w;
+    for (let x = -r; x <= r; x++) s += src[o + Math.min(w - 1, Math.max(0, x))];
+    for (let x = 0; x < w; x++) {
+      tmp[o + x] = s;
+      s += src[o + Math.min(w - 1, x + r + 1)] - src[o + Math.max(0, x - r)];
+    }
+  }
+  const n = (2 * r + 1) * (2 * r + 1);
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let y = -r; y <= r; y++) s += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = s / n;
+      s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+/** 가이드 필터 (He et al.): 거친 영역 P를 사진 I의 경계에 맞춰 다듬음 */
+function guidedFilter(I, P, w, h, r, eps) {
+  const n = w * h;
+  const II = new Float32Array(n);
+  const IP = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    II[i] = I[i] * I[i];
+    IP[i] = I[i] * P[i];
+  }
+  const mI = boxFilter(I, w, h, r);
+  const mP = boxFilter(P, w, h, r);
+  const mII = boxFilter(II, w, h, r);
+  const mIP = boxFilter(IP, w, h, r);
+  const A = new Float32Array(n);
+  const B = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const v = mII[i] - mI[i] * mI[i];
+    const cv = mIP[i] - mI[i] * mP[i];
+    A[i] = cv / (v + eps);
+    B[i] = mP[i] - A[i] * mI[i];
+  }
+  const mA = boxFilter(A, w, h, r);
+  const mB = boxFilter(B, w, h, r);
+  const q = new Float32Array(n);
+  for (let i = 0; i < n; i++) q[i] = mA[i] * I[i] + mB[i];
+  return q;
 }
 
 /* ---------- 도우미 ---------- */
@@ -73,11 +219,16 @@ function geometry(P) {
 
 /* ---------- 얼굴형 다듬기 (변형) ---------- */
 
+export const WARP_MAX = 64;
+
 /**
- * 뷰티 슬라이더 값으로 변형 목록을 만듭니다. 좌표·반지름은 긴 변 기준 단위.
- * @returns {{a:Float32Array, b:Float32Array, n:number}} a = [x, y, 반지름, 종류(0 확대, 1 밀기)], b = [밀기 x, y, 확대 세기, 0]
+ * 뷰티·몸매 슬라이더 값으로 변형 목록을 만듭니다. 좌표·반지름은 긴 변 기준 단위.
+ * @param adjFor 얼굴 번호 → 그 얼굴에 쓸 값 (얼굴별 따로 보정)
+ * @param poses 몸 지점 (없으면 null), body 몸매 값 { legs, waist, shoulder }
+ * @returns {{a:Float32Array, b:Float32Array, n:number, leg:object|null}}
+ *   a = [x, y, 반지름, 종류(0 확대, 1 밀기)], b = [밀기 x, y, 확대 세기, 0], leg = 다리 길게(세로 늘리기)
  */
-export function buildWarps(faces, adj, W, H, max = 40) {
+export function buildWarps(faces, adjFor, W, H, poses = null, body = {}, max = WARP_MAX) {
   const a = new Float32Array(max * 4);
   const b = new Float32Array(max * 4);
   let n = 0;
@@ -98,7 +249,8 @@ export function buildWarps(faces, adj, W, H, max = 40) {
     const f = target / Math.max(1, sum / list.length);
     for (const g of list) push(g.c[0], g.c[1], g.r, 1, g.v[0] * f, g.v[1] * f, 0);
   };
-  for (const face of faces || []) {
+  (faces || []).forEach((face, fi) => {
+    const adj = adjFor(fi);
     const P = toUnit(face, W, H);
     const g = geometry(P);
     // 눈 크게: 눈동자 중심 기준, 최대 약 8% 확대 (앱 기본값 수준은 2~4%)
@@ -112,7 +264,7 @@ export function buildWarps(faces, adj, W, H, max = 40) {
     // 중심을 얼굴 안쪽으로 조금 옮겨서 배경이 덜 휘게 함
     if (adj.faceSlim > 0) {
       for (const side of [JAW_R, JAW_L]) {
-        const list = side.map((i) => {
+        const list = side.filter((_, i) => i % 2 === 0).map((i) => {
           const dir = norm(sub(g.center, P[i]));
           return { c: add(P[i], mul(dir, g.faceW * 0.05)), r: g.faceW * 0.2, v: dir };
         });
@@ -129,13 +281,83 @@ export function buildWarps(faces, adj, W, H, max = 40) {
     if (adj.nose > 0) {
       const tip = P[4];
       const nw = len(sub(P[358], P[129]));
-      for (const side of [[129, 98], [358, 327]]) {
-        const list = side.map((i) => ({ c: P[i], r: nw * 0.4, v: norm(sub(tip, P[i])) }));
-        group(list, (adj.nose / 100) * nw * 0.06);
+      for (const i of [129, 358]) group([{ c: P[i], r: nw * 0.45, v: norm(sub(tip, P[i])) }], (adj.nose / 100) * nw * 0.06);
+    }
+  });
+
+  // 몸매 (자세 인식이 있을 때)
+  let leg = null;
+  const M = Math.max(W, H);
+  const seen = (p) => p && p[2] > 0.5;
+  const bodies = (poses || []).map((pose) => ({ raw: pose, P: pose.map(([x, y, v]) => [(x * W) / M, (y * H) / M, v]) }));
+  for (const { P } of bodies) {
+    const sh = [P[11], P[12]];
+    const hp = [P[23], P[24]];
+    if (!sh.every(seen) || !hp.every(seen)) continue;
+    const shoulderW = len(sub(sh[0], sh[1]));
+    const hipW = len(sub(hp[0], hp[1]));
+    const mid = mean([...sh, ...hp]);
+    // 허리 가늘게: 허리선 양옆을 몸 안쪽으로, 최대 한쪽 허리 폭의 약 7%
+    if (body.waist > 0) {
+      for (const [s, h] of [[sh[0], hp[0]], [sh[1], hp[1]]]) {
+        const torso = len(sub(s, h));
+        const w0 = add(h, mul(sub(s, h), 0.3));
+        const out = norm([w0[0] - mid[0], 0]);
+        const edge = add(w0, mul(out, hipW * 0.4));
+        const list = [-0.12, 0, 0.12].map((t) => ({ c: add(edge, [0, t * torso]), r: hipW * 0.55, v: mul(out, -1) }));
+        group(list, (body.waist / 100) * hipW * 0.08);
+      }
+    }
+    // 어깨 넓이: 어깨 끝을 바깥(+)·안쪽(−)으로, 최대 어깨 폭의 3.5%
+    if (body.shoulder) {
+      for (const s of sh) {
+        const out = norm([s[0] - mid[0], 0]);
+        const edge = add(s, mul(out, shoulderW * 0.12));
+        group([{ c: edge, r: shoulderW * 0.32, v: out }], (body.shoulder / 100) * shoulderW * 0.035);
       }
     }
   }
-  return { a, b, n };
+  // 다리 길게: 골반~발목 구간만 세로로 늘리고, 머리 위·발 아래 여백을 그만큼 줄여 사진 크기는 그대로
+  if (body.legs > 0) {
+    let y0 = Infinity;
+    let y1 = -Infinity;
+    let top = Infinity;
+    for (const { raw } of bodies) {
+      const px = (i) => [raw[i][0] * W, raw[i][1] * H, raw[i][2]];
+      const hp = [px(23), px(24)];
+      const kn = [px(25), px(26)];
+      const an = [px(27), px(28)];
+      if (!hp.every(seen) || !kn.some(seen)) continue;
+      y0 = Math.min(y0, Math.max(hp[0][1], hp[1][1]));
+      y1 = Math.max(y1, an.some(seen) ? Math.min(H, Math.max(...an.filter(seen).map((p) => p[1])) + H * 0.02) : H);
+      const nose = px(0);
+      const shY = (px(11)[1] + px(12)[1]) / 2;
+      top = Math.min(top, seen(nose) ? Math.max(0, nose[1] - (shY - nose[1]) * 1.1) : 0);
+    }
+    if (Number.isFinite(y0) && y1 - y0 > H * 0.1) {
+      const L = y1 - y0;
+      let extra = (body.legs / 100) * 0.1 * L;
+      const B = H - y1;
+      const T = Math.max(0, Math.min(top, y0));
+      extra = Math.min(extra, 0.6 * B + 0.6 * T);
+      if (extra > 0.5) {
+        const eb = Math.min(extra, 0.6 * B);
+        const et = extra - eb;
+        leg = { T, y0, y1, H, o1: T - et, o2: y0 - et, o3: y0 - et + L + extra };
+      }
+    }
+  }
+  return { a, b, n, leg };
+}
+
+/** 다리 길게: 화면 y → 원본 y (구간별 직선) */
+export function legMap(leg, y) {
+  if (!leg) return y;
+  const { T, y0, y1, H, o1, o2, o3 } = leg;
+  if (y < o1) return o1 > 0 ? (y * T) / o1 : y;
+  if (y < o2) return T + (y - o1);
+  if (y < o3) return y0 + ((y - o2) * (y1 - y0)) / (o3 - o2);
+  return H - o3 > 0 ? y1 + ((y - o3) * (H - y1)) / (H - o3) : y;
 }
 
 /* ---------- 부위별 영역 ---------- */
@@ -198,7 +420,8 @@ function layer(W, H, r, draw) {
 /**
  * 얼굴 부위 영역 두 장 (W×H, 원본 비율 좌표 기준)
  * mask1: R 얼굴 피부, G 입술, B 치아(입 안), A 눈밑
- * mask2: R 볼, G 눈
+ * mask2: R 볼, G 눈, B 아이섀도, A 눈썹
+ * mask3: R 얼굴 번호
  */
 export function buildMasks(faces, W, H) {
   const M = Math.max(W, H);
@@ -262,6 +485,54 @@ export function buildMasks(faces, W, H) {
     for (let i = 0; i < ch.length; i++) if (ch[i] > mx) mx = ch[i];
     if (mx > 0) for (let i = 0; i < ch.length; i++) ch[i] *= 255 / mx;
   }
+  // 아이섀도: 윗눈꺼풀 위쪽 (눈 자체는 빼고)
+  const shadow = layer(W, H, fw * 0.012, each((ctx, { f }) => {
+    for (const [lid, eye, brow] of [[[33, 246, 161, 160, 159, 158, 157, 173, 133], EYE_R, BROW_R], [[263, 466, 388, 387, 386, 385, 384, 398, 362], EYE_L, BROW_L]]) {
+      const ec = mean(eye.map((i) => [f[i][0] * W, f[i][1] * H]));
+      const bc = mean(brow.map((i) => [f[i][0] * W, f[i][1] * H]));
+      const up = mul(sub(bc, ec), 0.42);
+      const pts = lid.map((i) => [f[i][0] * W, f[i][1] * H]);
+      ctx.beginPath();
+      pts.forEach(([x, y], k) => (k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+      [...pts].reverse().forEach(([x, y]) => ctx.lineTo(x + up[0], y + up[1]));
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalCompositeOperation = 'destination-out';
+      poly(ctx, f, eye, W, H);
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }));
+  const brows = layer(W, H, fw * 0.004, each((ctx, { f }) => {
+    for (const idx of [BROW_R, BROW_L]) {
+      poly(ctx, f, idx, W, H);
+      ctx.fill();
+    }
+  }));
+  for (const ch of [shadow]) {
+    let mx = 0;
+    for (let i = 0; i < ch.length; i++) if (ch[i] > mx) mx = ch[i];
+    if (mx > 0) for (let i = 0; i < ch.length; i++) ch[i] *= 255 / mx;
+  }
+  // 얼굴 번호 지도: 가장 가까운 얼굴 (얼굴별 따로 보정용, 값 = (번호+1)×32)
+  const centers = geo.map(({ g }) => [g.center[0] * M, g.center[1] * M, g.faceW * M]);
+  const m3 = new ImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      let best = -1;
+      let bd = Infinity;
+      centers.forEach(([cx, cy, w], i) => {
+        const d = Math.hypot(x - cx, y - cy) / w;
+        if (d < bd) {
+          bd = d;
+          best = i;
+        }
+      });
+      const o = (y * W + x) * 4;
+      m3.data[o] = bd < 2 ? (best + 1) * 32 : 0;
+      m3.data[o + 3] = 255;
+    }
+  }
   const m1 = new ImageData(W, H);
   const m2 = new ImageData(W, H);
   const k = (v) => (v > 255 ? 255 : v);
@@ -272,10 +543,33 @@ export function buildMasks(faces, W, H) {
     m1.data[i + 3] = k(under[j]);
     m2.data[i] = k(cheeks[j]);
     m2.data[i + 1] = k(eyes[j]);
-    m2.data[i + 3] = 255;
+    m2.data[i + 2] = k(shadow[j]);
+    m2.data[i + 3] = k(brows[j]);
   }
-  return { m1, m2 };
+  return { m1, m2, m3 };
 }
+
+/** 메이크업 색 (sRGB 0~1) */
+export const LIP_COLORS = [
+  ['mlbb', 'MLBB', [0.72, 0.4, 0.42]],
+  ['coral', '코랄', [0.93, 0.46, 0.4]],
+  ['rose', '로즈', [0.84, 0.36, 0.5]],
+  ['red', '레드', [0.78, 0.13, 0.2]],
+  ['nude', '누드', [0.8, 0.56, 0.5]],
+  ['plum', '플럼', [0.56, 0.22, 0.34]],
+];
+export const BLUSH_COLORS = [
+  ['peach', '피치', [1.0, 0.72, 0.58]],
+  ['pink', '핑크', [1.0, 0.64, 0.72]],
+  ['coral', '코랄', [1.0, 0.6, 0.5]],
+  ['rose', '로즈', [0.92, 0.56, 0.62]],
+];
+export const SHADOW_COLORS = [
+  ['brown', '브라운', [0.6, 0.42, 0.32]],
+  ['pink', '핑크', [0.86, 0.58, 0.62]],
+  ['orange', '오렌지', [0.88, 0.56, 0.38]],
+  ['smoky', '스모키', [0.36, 0.33, 0.35]],
+];
 
 /** 자동 뷰티: 티 나지 않게 자연스러운 정도 */
 export const AUTO_BEAUTY = {

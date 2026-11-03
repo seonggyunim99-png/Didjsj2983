@@ -251,7 +251,24 @@ const extFor = (type) => (type === 'image/png' ? 'png' : 'jpg');
  * - 덮어쓰기: 처음 편집할 때의 원본을 따로 보관해서 '원본으로 되돌리기'가 가능해요.
  * - 사본: 원본은 그대로 두고 같은 촬영 일시의 새 사진을 만들어요.
  */
-export async function saveEdit(id, blob, { asCopy = false } = {}) {
+/**
+ * 다시 편집할 때 쓸 원본과 편집 값 (저장할 때 함께 보관해 둔 경우)
+ * @returns {Promise<{blob:Blob, type:string, state:object, baseId:string}|null>}
+ */
+export async function getEditBase(m) {
+  if (!m?.editState || !m.editBase) return null;
+  const src = store.byId.get(m.editBase);
+  if (!src) return null;
+  const blob = src.edited ? await db.getBlob(`orig:${src.id}`) : await db.getBlob(src.id);
+  if (!blob) return null;
+  return { blob, type: src.originalType || src.type, state: m.editState, baseId: src.id };
+}
+
+/**
+ * 편집한 사진 저장
+ * @param state 편집 값 (다시 편집할 수 있게 보관), baseId 편집을 시작한 원본 사진 (원본이 바뀌지 않는 경우만)
+ */
+export async function saveEdit(id, blob, { asCopy = false, state = null, baseId = null } = {}) {
   const m = store.byId.get(id);
   if (!m) throw new Error('사진을 찾을 수 없어요');
   const info = await makeImageThumb(blob);
@@ -280,6 +297,8 @@ export async function saveEdit(id, blob, { asCopy = false } = {}) {
       thumb: info.thumb,
       editedAt: now,
       copyOf: m.copyOf || m.id, // 원본과 그 사본은 '비슷한 사진'으로 묶지 않음
+      editState: state && baseId ? state : null,
+      editBase: state && baseId ? baseId : null,
     };
     await db.addMedia(rec, blob);
     store.media.push(rec);
@@ -306,6 +325,8 @@ export async function saveEdit(id, blob, { asCopy = false } = {}) {
     editedAt: now,
     exportedAt: null,
     stats: null,
+    editState: state && baseId ? state : null,
+    editBase: state && baseId ? baseId : null,
   });
   await db.putMedia(m);
   emit();
@@ -336,6 +357,8 @@ export async function revertEdit(id) {
     exportedAt: null,
     originalSize: 0,
     stats: null,
+    editState: null,
+    editBase: null,
   });
   delete m.originalType;
   delete m.originalName;

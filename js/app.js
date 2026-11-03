@@ -12,11 +12,12 @@ import { Viewer } from './viewer.js';
 import { Editor } from './editor.js';
 import * as lock from './lock.js';
 import { createScroller } from './scroller.js';
-import { reviewEnhance, runBatchEnhance, STRENGTHS } from './enhance.js';
+import { reviewEnhance, runBatchEnhance, runBatchStyle, STRENGTHS } from './enhance.js';
+import * as looks from './looks.js';
 import { openCollage } from './collage.js';
 import { canvasToBlob } from './imaging.js';
 
-const APP_VERSION = '3.4.0';
+const APP_VERSION = '4.0.0';
 
 const $ = (s, root = document) => root.querySelector(s);
 const appbar = $('#appbar');
@@ -1305,8 +1306,12 @@ async function loadPhotoDetails(m) {
 async function openEditor(id) {
   const m = store.byId.get(id);
   if (!m || m.kind !== 'image' || editor) return;
-  const blob = await lib.getOriginal(id);
+  // 다시 편집: 저장할 때 보관한 원본 + 편집 값이 있으면 거기서 이어서
+  const base = await lib.getEditBase(m).catch(() => null);
+  const blob = base ? base.blob : await lib.getOriginal(id);
   if (!blob) return;
+  // 편집하지 않은 사진이면 지금 파일이 곧 원본 → 편집 값을 보관할 수 있음
+  const baseId = base ? base.baseId : m.edited ? null : id;
   let instance = null;
   let allowClose = false;
   const closeLayer = () => {
@@ -1328,14 +1333,15 @@ async function openEditor(id) {
     editor = 'opening';
     instance = await Editor.open({
       blob,
-      type: m.type,
+      type: base ? base.type : m.type,
       name: m.name,
+      state: base?.state || null,
       onCancel: () => {
         allowClose = true;
         popLayer();
       },
-      onSave: async (out, asCopy) => {
-        const saved = await lib.saveEdit(id, out, { asCopy });
+      onSave: async (out, asCopy, state) => {
+        const saved = await lib.saveEdit(id, out, { asCopy, state, baseId });
         allowClose = true;
         popLayer();
         if (asCopy) {
@@ -2177,6 +2183,8 @@ async function onSelectionAction(act) {
         { label: '기기에 저장', icon: 'download', value: 'download' },
         { label: '자동 보정', icon: 'auto', value: 'auto-enhance', hint: images.length ? `사진 ${fmtNum(images.length)}장 · 미리 보고 적용해요` : '사진을 골라 주세요' },
       ];
+      if (images.length && looks.getClip()) opts.push({ label: '보정 붙여넣기', icon: 'copy', value: 'paste-style', hint: '마지막으로 저장하거나 복사한 보정을 똑같이 적용해요' });
+      if (images.length && looks.listPresets().length) opts.push({ label: '내 보정 적용', icon: 'tune', value: 'apply-preset', hint: '저장해 둔 나만의 보정을 골라 적용해요' });
       if (images.length >= 2 && images.length <= 9) opts.push({ label: '콜라주 만들기', icon: 'grid', value: 'collage' });
       if (items.some((m) => m.edited)) opts.push({ label: '원본으로 되돌리기', icon: 'restore', value: 'revert-all' });
       opts.push({ label: '숨기기', icon: 'lock', value: 'hide', hint: '사진 탭·검색·추억에서 숨겨요' });
@@ -2191,6 +2199,38 @@ async function onSelectionAction(act) {
       if (!picked?.ids.length) return;
       exitSelection();
       await applyEnhance(picked);
+      break;
+    }
+    case 'paste-style':
+    case 'apply-preset': {
+      const images = items.filter((m) => m.kind === 'image');
+      if (!images.length) return;
+      let style = null;
+      let name = '복사한 보정';
+      if (act === 'paste-style') style = looks.getClip()?.style;
+      else {
+        const list = looks.listPresets();
+        const id = await actionSheet({ title: '적용할 내 보정', items: list.map((p) => ({ label: p.name, icon: 'tune', value: p.id })) });
+        const p = id && looks.getPreset(id);
+        if (!p) return;
+        style = p.style;
+        name = p.name;
+      }
+      if (!style) return;
+      const how = await actionSheet({
+        title: `${fmtNum(images.length)}장에 ‘${name}’ 적용`,
+        items: [
+          { label: '적용', icon: 'check', value: 'replace', hint: '편집 전 원본은 보관돼서 언제든 되돌릴 수 있어요' },
+          { label: '사본으로 저장', icon: 'copy', value: 'copy', hint: '원본은 그대로 두고 새 사진으로 저장해요' },
+        ],
+      });
+      if (!how) return;
+      exitSelection();
+      const r = await runBatchStyle(images.map((m) => m.id), style, { asCopy: how === 'copy' });
+      const parts = [`${fmtNum(r.done)}장에 보정을 적용했어요`];
+      if (r.failed) parts.push(`${fmtNum(r.failed)}장은 실패`);
+      if (r.stopped) parts.push('중간에 멈춤');
+      toast(parts.join(' · '));
       break;
     }
     case 'collage':

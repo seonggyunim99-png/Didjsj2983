@@ -1,11 +1,13 @@
 // 사진 편집기: 보정(자동·장면) · 자르기/원근 · 필터 · 조정(빛·색상·효과·디테일·톤 커브·색상별·컬러 그레이딩)
 //             · 인물(얼굴 인식 뷰티 · 잡티 제거) · 성형(손으로 밀기·크게·작게) · 부분(칠해서 보정) · 그리기
-import { icon, esc, toast, confirmDialog, actionSheet, isModalOpen } from './ui.js';
+import { icon, esc, toast, confirmDialog, actionSheet, isModalOpen, promptDialog } from './ui.js';
+import * as looks from './looks.js';
 import * as dv from './develop.js';
 import * as im from './imaging.js';
 import { createRenderer, measure, renderFinal, drawStrokes } from './glrender.js';
-import { detectFaces, AUTO_BEAUTY } from './face.js';
+import { detectFaces, detectPoses, segmentPerson, AUTO_BEAUTY, LIP_COLORS, BLUSH_COLORS, SHADOW_COLORS } from './face.js';
 import { LIQ_TOOLS, LOCAL_TOOLS } from './retouch.js';
+import { removeArea } from './inpaint.js';
 
 const TABS = [
   ['enhance', 'auto', '보정'],
@@ -30,6 +32,10 @@ const TRACKS = {
   hue: 'linear-gradient(to right, #ff4040, #ffd040, #40ff60, #40e0ff, #4060ff, #e040ff, #ff4040)',
 };
 const WORK_MAX = 2048;
+const AUTO_GROUPS = ['skin', 'shape', 'parts'];
+const FACE_GROUPS = ['skin', 'shape', 'parts', 'makeup'];
+const MK_COLORS = { lip: LIP_COLORS, blush: BLUSH_COLORS, shadow: SHADOW_COLORS };
+const css = (rgb) => `rgb(${rgb.map((v) => Math.round(v * 255)).join(',')})`;
 const MIN_CROP = 0.06;
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -96,8 +102,9 @@ export class Editor {
     return ed;
   }
 
-  constructor({ blob, type, name, onSave, onCancel }) {
+  constructor({ blob, type, name, state = null, onSave, onCancel }) {
     this.blob = blob;
+    this.initState = state;
     this.type = type;
     this.name = name;
     this.onSave = onSave;
@@ -125,6 +132,11 @@ export class Editor {
     this.op = null;
     this.faces = undefined; // undefined 아직 · null 찾는 중 실패 · [] 없음 · [...] 찾음
     this.faceState = 'idle';
+    this.poses = null;
+    this.poseState = 'idle';
+    this.person = null;
+    this.segState = 'idle';
+    this.faceSel = -1; // 얼굴별 따로 보정: -1 = 모든 얼굴
     this.zoom = 1;
     this.pan = { x: 0, y: 0 };
     this.baseDirty = true;
@@ -141,7 +153,7 @@ export class Editor {
         <div class="ed-history">
           <button type="button" class="ed-icon" data-act="undo" aria-label="실행 취소" title="실행 취소">${icon('undo')}</button>
           <button type="button" class="ed-icon" data-act="redo" aria-label="다시 실행" title="다시 실행">${icon('redo')}</button>
-          <button type="button" class="ed-icon" data-act="compare" aria-label="원본과 비교 (누르고 있기)" title="누르고 있으면 원본을 보여줘요">${icon('compare')}</button>
+          <button type="button" class="ed-icon" data-act="compare" aria-label="원본과 비교 (누르면 나눠 보기, 누르고 있으면 원본)" title="누르면 반반 비교 · 누르고 있으면 원본">${icon('compare')}</button>
         </div>
         <button type="button" class="btn primary sm" data-act="save">저장</button>
       </header>
@@ -151,6 +163,7 @@ export class Editor {
         <canvas class="ed-hist" width="160" height="70" hidden></canvas>
         <button type="button" class="ed-zoom" data-act="zoom-reset" hidden></button>
         <div class="ed-ring" hidden></div>
+        <div class="ed-split" hidden><i></i><b>${icon('compare')}</b><span class="l">원본</span><span class="r">보정</span></div>
         <div class="ed-busy"><i></i><span></span></div>
       </div>
       <div class="ed-panel"></div>
@@ -162,6 +175,8 @@ export class Editor {
     this.histEl = root.querySelector('.ed-hist');
     this.zoomEl = root.querySelector('.ed-zoom');
     this.ringEl = root.querySelector('.ed-ring');
+    this.splitEl = root.querySelector('.ed-split');
+    this.splitPos = 0.5;
     this.panel = root.querySelector('.ed-panel');
     document.body.appendChild(root);
     document.body.classList.add('editor-open');
@@ -214,12 +229,47 @@ export class Editor {
     }
     if (!this.renderer.gpu) toast('이 기기에서는 고급 보정 일부를 쓸 수 없어 기본 보정만 적용돼요', { duration: 5000 });
     this.root.classList.toggle('no-gpu', !this.renderer.gpu);
+    if (this.initState) this.resumeState(this.initState);
     this.root.classList.remove('loading');
     this.renderPanel();
     this.layout();
   }
 
+  /** 저장할 때 보관한 편집 값으로 이어서 편집 (원본에서 다시 계산) */
+  resumeState(saved) {
+    const d = dv.defaultState();
+    const st = { ...d, ...JSON.parse(JSON.stringify(saved)) };
+    st.adj = { ...d.adj, ...st.adj };
+    st.geo = { ...d.geo, ...st.geo };
+    this.st = st;
+    this.history = [JSON.stringify(this.st)];
+    this.hIndex = 0;
+    this.savedSnap = this.history[0];
+    if (st.heals?.length) {
+      this.appliedHeals = '[]';
+      this.syncHeals();
+    }
+    const need = looks.styleNeeds(st.adj);
+    if (need.faces || Object.keys(st.faceAdj || {}).length) this.ensureFaces();
+    if (need.poses) this.ensurePose();
+    if (need.person) this.ensureSeg();
+    if (dv.isEdited(st)) toast('지난번 편집을 이어서 고칠 수 있어요 · 모든 값이 그대로 남아 있어요', { duration: 3500 });
+  }
+
+  /** 저장 전에 진행 중인 인식이 끝나기를 기다림 (얼굴·몸·배경 보정이 빠지지 않게) */
+  async waitDetect() {
+    const need = looks.styleNeeds(this.st.adj);
+    if (need.faces || Object.keys(this.st.faceAdj || {}).length) this.ensureFaces();
+    if (need.poses) this.ensurePose();
+    if (need.person) this.ensureSeg();
+    for (let i = 0; i < 600 && [this.faceState, this.poseState, this.segState].includes('busy'); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
   get dirty() {
+    // 이어서 편집하는 경우: 열었을 때와 같으면 바뀐 것 없음
+    if (this.savedSnap && this.history[this.hIndex] === this.savedSnap && !this.op) return false;
     return dv.isEdited(this.st);
   }
 
@@ -281,6 +331,7 @@ export class Editor {
     this.zoomEl.hidden = this.zoom <= 1.01;
     this.zoomEl.textContent = `${Math.round(this.zoom * 100)}%`;
     if (this.tab === 'crop') this.positionCrop();
+    if (this.split) this.positionSplit();
   }
 
   zoomAt(clientX, clientY, z) {
@@ -398,11 +449,51 @@ export class Editor {
     }
     ctx.clearRect(0, 0, c.width, c.height);
     ctx.drawImage(this.glCanvas, 0, 0);
+    if (this.split && this.tab !== 'crop') {
+      try {
+        const orig = this.originalLayer(region, c.width, c.height, pxScale);
+        const x = Math.round(c.width * this.splitPos);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, x, c.height);
+        ctx.clip();
+        ctx.drawImage(orig, 0, 0);
+        ctx.restore();
+      } catch (err) {
+        console.warn(err);
+      }
+      this.positionSplit();
+    }
     const strokes = this.cur ? [...this.st.strokes, this.cur] : this.st.strokes;
     drawStrokes(ctx, this.glCanvas, strokes, this.matrix, this.Ww, this.Hw);
+    if (this.tab === 'beauty' && this.faces?.length > 1 && FACE_GROUPS.includes(this.bgroup) && !this.healMode && !this.eraseMode) this.drawFaceBadges(ctx);
     if (this.tab === 'crop') this.positionCrop();
     this.updateTop();
     this.scheduleHistogram();
+  }
+
+  /** 단체 사진: 얼굴마다 번호 표시 (고른 얼굴은 파랗게) */
+  drawFaceBadges(ctx) {
+    const r = Math.max(9, Math.min(this.canvas.width, this.canvas.height) * 0.028);
+    ctx.save();
+    ctx.font = `700 ${Math.round(r * 1.15)}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    this.faces.forEach((f, i) => {
+      const top = f[10];
+      const [x, y] = dv.mapPoint(this.matrix, top[0] * this.Ww, top[1] * this.Hw);
+      const cy = y - r * 1.6;
+      ctx.beginPath();
+      ctx.arc(x, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = this.faceSel === i ? '#3b82f6' : 'rgba(0,0,0,0.55)';
+      ctx.fill();
+      ctx.lineWidth = Math.max(1.5, r * 0.14);
+      ctx.strokeStyle = '#fff';
+      ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.fillText(String(i + 1), x, cy + r * 0.05);
+    });
+    ctx.restore();
   }
 
   invalidate() {
@@ -527,7 +618,7 @@ export class Editor {
     const faceOk = !!this.faces?.length;
     let any = false;
     for (const a of dv.ADJ) {
-      if (a.g !== 'beauty') continue;
+      if (a.g !== 'beauty' || !AUTO_GROUPS.includes(a.bg)) continue;
       const want = a.face && !faceOk ? 0 : AUTO_BEAUTY[a.key] || 0;
       if (adj[a.key] !== want) return false;
       if (want) any = true;
@@ -555,6 +646,78 @@ export class Editor {
       this.faceState = 'error';
     }
     if (!this.destroyed && this.tab === 'beauty') this.renderPanel();
+  }
+
+  /** 몸매 묶음을 처음 열 때 한 번 자세(어깨·골반·다리)를 찾습니다 */
+  async ensurePose() {
+    if (this.poseState !== 'idle' || !this.work || !this.renderer?.gpu) return;
+    this.poseState = 'busy';
+    try {
+      const poses = await detectPoses(this.work);
+      if (this.destroyed) return;
+      this.poses = poses;
+      this.renderer.setPoses(poses);
+      this.poseState = 'done';
+      this.invalidate();
+    } catch (err) {
+      console.warn('자세 인식 실패', err);
+      this.poses = [];
+      this.poseState = 'error';
+    }
+    if (!this.destroyed && this.tab === 'beauty') this.renderPanel();
+  }
+
+  /** 배경 묶음을 처음 열 때 한 번 사람 영역을 찾습니다 */
+  async ensureSeg() {
+    if (this.segState !== 'idle' || !this.work || !this.renderer?.gpu) return;
+    this.segState = 'busy';
+    try {
+      const person = await segmentPerson(this.work, this.Ww, this.Hw);
+      if (this.destroyed) return;
+      this.person = person;
+      this.renderer.setPerson(person);
+      this.segState = 'done';
+      this.invalidate();
+    } catch (err) {
+      console.warn('사람 영역 찾기 실패', err);
+      this.person = null;
+      this.segState = 'error';
+    }
+    if (!this.destroyed && this.tab === 'beauty') this.renderPanel();
+  }
+
+  /** 지금 묶음에 필요한 인식 시작 */
+  ensureDetect() {
+    this.ensureFaces();
+    if (this.bgroup === 'body') this.ensurePose();
+    if (this.bgroup === 'bg') this.ensureSeg();
+  }
+
+  /** 인물 탭 슬라이더 값 (얼굴을 골랐으면 그 얼굴 값) */
+  beautyValue(key) {
+    if (this.faceSel >= 0 && dv.FACE_KEYS.includes(key)) return dv.faceAdj(this.st.adj, this.st, this.faceSel)[key];
+    return this.st.adj[key];
+  }
+
+  /** 인물 탭 값 바꾸기 (얼굴을 골랐으면 그 얼굴만) */
+  setBeauty(key, v) {
+    const st = this.st;
+    if (this.faceSel >= 0 && dv.FACE_KEYS.includes(key)) {
+      st.faceAdj = st.faceAdj || {};
+      st.faceAdj[this.faceSel] = { ...(st.faceAdj[this.faceSel] || {}), [key]: v };
+    } else st.adj[key] = v;
+  }
+
+  beautyRow(a) {
+    const v = this.beautyValue(a.key);
+    const ok = a.face ? !!this.faces?.length : a.pose ? !!this.poses?.length : a.seg ? !!this.person : true;
+    let row = this.sliderRow({ attrs: `data-adj="${a.key}"`, label: a.label, value: v, min: a.min, max: a.max, text: fmtAdj(a, v), changed: !!v });
+    if (!ok) row = row.replace('<input', '<input disabled').replace('ed-slider-row', 'ed-slider-row disabled');
+    if (a.color && ok) {
+      const cur = this.st.makeup?.[a.color];
+      row += `<div class="ed-mks">${MK_COLORS[a.color].map(([id, name, rgb]) => `<button type="button" class="ed-mk${cur === id ? ' on' : ''}" data-mk="${a.color}:${id}" style="--c:${css(rgb)}" aria-label="${esc(name)}" title="${esc(name)}"><i></i><span>${esc(name)}</span></button>`).join('')}</div>`;
+    }
+    return row;
   }
 
   groupChanged(g) {
@@ -593,7 +756,16 @@ export class Editor {
           <button type="button" class="ed-btn" data-act="reset-geo">${icon('restore')}<span>초기화</span></button>
         </div>`;
     } else if (this.tab === 'filter') {
+      const presets = looks.listPresets();
+      const clip = looks.getClip();
       html = `
+        <div class="ed-chips ed-mylooks">
+          <button type="button" class="ed-chip" data-act="copy-style"${this.dirty ? '' : ' disabled'}>${icon('copy')}보정 복사</button>
+          <button type="button" class="ed-chip" data-act="paste-style"${clip ? '' : ' disabled'}>${icon('check')}붙여넣기</button>
+          <button type="button" class="ed-chip ed-auto" data-act="save-preset"${this.dirty ? '' : ' disabled'}>${icon('add')}내 보정 저장</button>
+          ${presets.map((p) => `<button type="button" class="ed-chip ed-preset" data-preset="${esc(p.id)}">${esc(p.name)}</button>`).join('')}
+          ${presets.length ? `<button type="button" class="ed-chip" data-act="manage-presets">${icon('settings')}관리</button>` : ''}
+        </div>
         <div class="ed-filters">${dv.LOOKS.map((f) => `
           <button type="button" class="ed-filter${st.look === f.id ? ' on' : ''}" data-filter="${f.id}">
             <canvas width="2" height="2"></canvas><span>${esc(f.name)}</span>
@@ -613,19 +785,39 @@ export class Editor {
     } else if (this.tab === 'beauty') {
       const fs = this.faceState;
       const n = this.faces?.length || 0;
-      const status = fs === 'busy' ? '얼굴을 찾는 중…'
+      const bg = this.bgroup;
+      let status = fs === 'busy' ? '얼굴을 찾는 중…'
         : fs === 'error' ? '얼굴 인식을 불러오지 못했어요 · 피부 보정만 쓸 수 있어요'
           : fs === 'done' && !n ? '얼굴을 찾지 못했어요 · 피부 보정만 쓸 수 있어요'
             : fs === 'done' ? `얼굴 ${n}명을 찾았어요` : '';
-      const rows = dv.ADJ.filter((a) => a.g === 'beauty' && a.bg === this.bgroup);
+      let busy = fs === 'busy';
+      if (bg === 'body') {
+        const ps = this.poseState;
+        const np = this.poses?.length || 0;
+        busy = ps === 'busy';
+        status = busy ? '몸을 찾는 중… (처음 한 번 약 6MB 내려받아요)' : ps === 'error' ? '자세 인식을 불러오지 못했어요'
+          : !np ? '몸(어깨·골반)을 찾지 못했어요 · 전신이나 상반신이 보이는 사진에서 쓸 수 있어요' : `${np}명의 몸을 찾았어요 · 다리 길게는 골반과 무릎이 보여야 해요`;
+      } else if (bg === 'bg') {
+        const ss = this.segState;
+        busy = ss === 'busy';
+        status = busy ? '사람과 배경을 나누는 중… (처음 한 번 약 16MB 내려받아요)' : ss === 'error' ? '배경 나누기를 불러오지 못했어요'
+          : !this.person ? '사람을 찾지 못했어요' : '사람과 배경을 나눴어요';
+      }
+      const rows = dv.ADJ.filter((a) => a.g === 'beauty' && a.bg === bg);
       const autoOn = this.beautyAuto();
+      const faceTabs = n > 1 && FACE_GROUPS.includes(bg)
+        ? `<div class="ed-chips ed-face-sel">
+            <button type="button" class="ed-chip${this.faceSel < 0 ? ' on' : ''}" data-face-sel="-1">모든 얼굴</button>
+            ${this.faces.map((_, i) => `<button type="button" class="ed-chip${this.faceSel === i ? ' on' : ''}${Object.values(st.faceAdj?.[i] || {}).some((v) => v) ? ' changed' : ''}" data-face-sel="${i}">${i + 1}번 얼굴</button>`).join('')}
+          </div>` : '';
       html = `
         <div class="ed-chips ed-groups">
           ${dv.BEAUTY_GROUPS.map(([k, label]) => `<button type="button" class="ed-chip${k === this.bgroup ? ' on' : ''}${dv.ADJ.some((a) => a.bg === k && st.adj[a.key]) ? ' changed' : ''}" data-bgroup="${k}">${label}</button>`).join('')}
           <button type="button" class="ed-chip ed-auto${autoOn ? ' on' : ''}" data-act="auto-beauty"${fs === 'busy' ? ' disabled' : ''}>${icon('face')}자동 뷰티</button>
           <button type="button" class="ed-chip" data-act="reset-beauty">${icon('restore')}초기화</button>
         </div>
-        <p class="ed-face-status${fs === 'busy' ? ' busy' : ''}" aria-live="polite">${esc(status)}</p>
+        <p class="ed-face-status${busy ? ' busy' : ''}" aria-live="polite">${esc(status)}</p>
+        ${faceTabs}
         <div class="ed-chips">
           <button type="button" class="ed-chip${this.healMode ? ' on' : ''}" data-act="heal-toggle" aria-pressed="${this.healMode}">${icon('healing')}잡티 제거</button>
           <button type="button" class="ed-chip${this.eraseMode ? ' on' : ''}" data-act="erase-toggle" aria-pressed="${this.eraseMode}">${icon('erase')}보정 지우개</button>
@@ -643,11 +835,15 @@ export class Editor {
             </div>
             ${this.sliderRow({ attrs: 'data-slider="erSize"', label: '브러시 크기', value: this.er.size, min: 4, max: 100, text: `${this.er.size}`, reset: false })}
             ${this.sliderRow({ attrs: 'data-slider="erStrength"', label: '세기', value: this.er.strength, min: 10, max: 100, text: `${this.er.strength}`, reset: false })}`
-      : rows.map((a) => (a.face && !n ? this.adjRow(a).replace('<input', '<input disabled').replace('ed-slider-row', 'ed-slider-row disabled') : this.adjRow(a))).join('')}
+      : rows.map((a) => this.beautyRow(a)).join('')}
         </div>
         <p class="ed-hint">${this.healMode ? '사진을 확대한 뒤 잡티·여드름·점을 톡 누르거나 문지르세요. 주변 피부로 자연스럽게 메워요.'
     : this.eraseMode ? (this.er.tool === 'fx' ? '문지른 곳은 얼굴형·피부·입술 등 인물 보정과 성형·부분 보정이 빠지고 원래 모습으로 돌아가요. (밝기·색감·필터는 그대로)' : '지웠던 곳을 문지르면 보정이 다시 살아나요.')
-      : '얼굴을 찾아 피부·눈·코·입·얼굴형을 자연스럽게 다듬어요. 사진은 기기 밖으로 나가지 않아요.'}</p>`;
+      : {
+        makeup: '색을 고르고 슬라이더로 진하기를 정해요. 원래 입술·피부의 명암은 그대로 살려요.',
+        body: '다리 길게는 머리 위·발 아래 여백을 조금 줄여 사진 크기는 그대로 둬요.',
+        bg: '배경 흐림은 인물 사진(아웃포커싱)처럼 사람만 또렷하게 남겨요.',
+      }[bg] || (n > 1 ? '얼굴을 골라 사람마다 따로 보정할 수 있어요. 사진은 기기 밖으로 나가지 않아요.' : '얼굴을 찾아 피부·눈·코·입·얼굴형을 자연스럽게 다듬어요. 사진은 기기 밖으로 나가지 않아요.')}</p>`;
     } else if (this.tab === 'reshape') {
       const L = this.liq;
       html = `
@@ -668,10 +864,19 @@ export class Editor {
   }[L.tool]}</p>`;
     } else if (this.tab === 'local') {
       const C = this.lc;
+      const removing = C.tool === 'remove';
+      const fills = st.heals.filter((h) => h.t === 'fill').length;
       html = `
         <div class="ed-chips ed-lc-tools">
+          <button type="button" class="ed-chip ed-auto${removing ? ' on' : ''}" data-lc-tool="remove">${icon('erase')}사물 지우기</button>
           ${LOCAL_TOOLS.map(([k, label]) => `<button type="button" class="ed-chip${C.tool === k ? ' on' : ''}" data-lc-tool="${k}">${label}</button>`).join('')}
         </div>
+        ${removing ? `
+        ${this.sliderRow({ attrs: 'data-slider="lcSize"', label: '브러시 크기', value: C.size, min: 4, max: 100, text: `${C.size}`, reset: false })}
+        <div class="ed-chips">
+          <button type="button" class="ed-chip" data-act="undo-fill"${fills ? '' : ' disabled'}>${icon('undo')}한 번 되돌리기</button>
+        </div>
+        <p class="ed-hint">지우고 싶은 사람·물건·전선·글자를 빈틈없이 덮어 칠하면, 주변 배경으로 자연스럽게 채워요. 배경이 단순할수록 깔끔해요.</p>` : `
         ${this.sliderRow({ attrs: 'data-slider="lcSize"', label: '브러시 크기', value: C.size, min: 4, max: 100, text: `${C.size}`, reset: false })}
         ${this.sliderRow({ attrs: 'data-slider="lcStrength"', label: '세기', value: C.strength, min: 5, max: 100, text: `${C.strength}`, reset: false })}
         <div class="ed-chips">
@@ -679,7 +884,7 @@ export class Editor {
           <button type="button" class="ed-chip" data-act="undo-local"${st.local.length ? '' : ' disabled'}>${icon('undo')}한 획 되돌리기</button>
           <button type="button" class="ed-chip" data-act="clear-local"${st.local.length ? '' : ' disabled'}>${icon('trash')}모두 지우기</button>
         </div>
-        <p class="ed-hint">${C.tool === 'erase' ? '문지른 곳의 부분 보정을 지워요.' : '보정하고 싶은 곳만 문질러 주세요. 같은 곳을 여러 번 문지르면 더 강해져요.'}</p>`;
+        <p class="ed-hint">${C.tool === 'erase' ? '문지른 곳의 부분 보정을 지워요.' : '보정하고 싶은 곳만 문질러 주세요. 같은 곳을 여러 번 문지르면 더 강해져요.'}</p>`}`;
     } else if (this.tab === 'draw') {
       html = `
         <div class="ed-chips">
@@ -917,7 +1122,8 @@ export class Editor {
     const st = this.st;
     if (r.dataset.adj) {
       const a = dv.ADJ_BY_KEY[r.dataset.adj];
-      st.adj[a.key] = v;
+      if (this.tab === 'beauty') this.setBeauty(a.key, v);
+      else st.adj[a.key] = v;
       out.textContent = fmtAdj(a, v);
       row.classList.toggle('changed', !!v);
       this.refreshGroupChips();
@@ -1020,7 +1226,7 @@ export class Editor {
           this.healMode = false;
           this.eraseMode = false;
         }
-        else this.ensureFaces();
+        else this.ensureDetect();
         if (this.tab !== 'local' && this.showLocal) {
           this.showLocal = false;
           this.renderer.showLocal = false;
@@ -1029,6 +1235,7 @@ export class Editor {
         this.ringEl.hidden = true;
         this.renderPanel();
         this.layout();
+        this.positionSplit();
       }
       return;
     }
@@ -1076,6 +1283,28 @@ export class Editor {
       this.renderPanel();
       return;
     }
+    if ((el = pick('[data-preset]'))) {
+      const p = looks.getPreset(el.dataset.preset);
+      if (p) this.useStyle(p.style, `‘${p.name}’ 보정을 적용했어요`);
+      return;
+    }
+    if ((el = pick('[data-face-sel]'))) {
+      this.faceSel = +el.dataset.faceSel;
+      this.renderPanel();
+      this.requestPaint();
+      return;
+    }
+    if ((el = pick('[data-mk]'))) {
+      const [kind, id] = el.dataset.mk.split(':');
+      st.makeup = { ...(st.makeup || {}), [kind]: id };
+      // 색을 고르면 바로 보이도록 진하기를 조금 올려 줌
+      const key = { lip: 'mkLip', blush: 'mkBlush', shadow: 'mkShadow' }[kind];
+      if (!this.beautyValue(key)) this.setBeauty(key, 50);
+      this.commit();
+      this.renderPanel();
+      this.invalidate();
+      return;
+    }
     if ((el = pick('[data-er-tool]'))) {
       this.er.tool = el.dataset.erTool;
       this.renderPanel();
@@ -1090,6 +1319,7 @@ export class Editor {
       this.bgroup = el.dataset.bgroup;
       this.healMode = false;
       this.eraseMode = false;
+      this.ensureDetect();
       this.renderPanel();
       return;
     }
@@ -1196,9 +1426,12 @@ export class Editor {
         const on = this.beautyAuto();
         const faceOk = !!this.faces?.length;
         for (const a of dv.ADJ) {
-          if (a.g !== 'beauty') continue;
+          if (a.g !== 'beauty' || !AUTO_GROUPS.includes(a.bg)) continue;
           st.adj[a.key] = on ? 0 : (a.face && !faceOk ? 0 : AUTO_BEAUTY[a.key] || 0);
         }
+        // 자동 뷰티는 모든 얼굴에 같은 값 (얼굴별로 따로 정한 값은 비움)
+        st.faceAdj = {};
+        this.faceSel = -1;
         this.commit();
         this.renderPanel();
         this.invalidate();
@@ -1207,6 +1440,7 @@ export class Editor {
       }
       case 'reset-beauty':
         for (const a of dv.ADJ) if (a.g === 'beauty') st.adj[a.key] = 0;
+        st.faceAdj = {};
         this.commit();
         this.renderPanel();
         this.invalidate();
@@ -1254,6 +1488,35 @@ export class Editor {
         this.healMode = !this.healMode;
         this.renderPanel();
         break;
+      case 'copy-style':
+        looks.setClip(st);
+        toast('보정을 복사했어요 · 다른 사진의 편집 화면이나 여러 장 선택 → 더보기에서 붙여넣을 수 있어요', { duration: 4000 });
+        this.renderPanel();
+        break;
+      case 'paste-style': {
+        const c = looks.getClip();
+        if (c) this.useStyle(c.style, '복사한 보정을 붙여넣었어요');
+        break;
+      }
+      case 'save-preset':
+        this.savePresetFlow();
+        break;
+      case 'manage-presets':
+        this.managePresets();
+        break;
+      case 'undo-fill': {
+        const i = st.heals.map((h) => h.t).lastIndexOf('fill');
+        if (i >= 0) st.heals.splice(i, 1);
+        this.setBusy('되돌리는 중…');
+        setTimeout(() => {
+          this.syncHeals();
+          this.setBusy('');
+          this.commit();
+          this.renderPanel();
+          this.invalidate();
+        }, 30);
+        break;
+      }
       case 'undo-heal':
         st.heals.pop();
         this.syncHeals();
@@ -1282,7 +1545,8 @@ export class Editor {
   applyEnhance() {
     const en = this.st.enhance;
     const stats = measure(this.renderer, this.st);
-    this.st.adj = { ...dv.defaultState().adj, ...dv.autoAdjust(stats, { strength: en.strength, scene: en.scene }).adj };
+    const keep = Object.fromEntries(dv.ADJ.filter((a) => a.g === 'beauty').map((a) => [a.key, this.st.adj[a.key]]));
+    this.st.adj = { ...dv.defaultState().adj, ...dv.autoAdjust(stats, { strength: en.strength, scene: en.scene }).adj, ...keep };
     this.baseDirty = true;
   }
 
@@ -1290,7 +1554,8 @@ export class Editor {
     const en = this.st.enhance;
     if (en.on) {
       en.on = false;
-      this.st.adj = en.prev ? { ...en.prev } : dv.defaultState().adj;
+      const keep = Object.fromEntries(dv.ADJ.filter((a) => a.g === 'beauty').map((a) => [a.key, this.st.adj[a.key]]));
+      this.st.adj = { ...(en.prev ? { ...en.prev } : dv.defaultState().adj), ...keep };
       en.prev = null;
     } else {
       en.prev = { ...this.st.adj };
@@ -1322,22 +1587,104 @@ export class Editor {
 
   bindCompare() {
     const btn = this.root.querySelector('[data-act="compare"]');
+    let timer = 0;
+    let held = false;
     const on = (e) => {
       e.preventDefault();
       if (!this.work) return;
-      this.comparing = true;
-      this.root.classList.add('comparing');
-      this.paint();
+      held = false;
+      clearTimeout(timer);
+      // 누르고 있으면 원본 전체, 짧게 누르면 반반 비교 켜고 끄기
+      timer = setTimeout(() => {
+        held = true;
+        this.comparing = true;
+        this.root.classList.add('comparing');
+        this.paint();
+      }, 260);
     };
-    const off = () => {
-      if (!this.comparing) return;
-      this.comparing = false;
-      this.root.classList.remove('comparing');
-      this.paint();
+    const off = (e) => {
+      clearTimeout(timer);
+      if (this.comparing) {
+        this.comparing = false;
+        this.root.classList.remove('comparing');
+        this.paint();
+        return;
+      }
+      if (e.type === 'pointerup' && !held) this.toggleSplit();
     };
     btn.addEventListener('pointerdown', on);
     ['pointerup', 'pointerleave', 'pointercancel'].forEach((t) => btn.addEventListener(t, off));
     btn.addEventListener('contextmenu', (e) => e.preventDefault());
+    // 가운데 손잡이를 끌어 비교 위치 바꾸기
+    const el = this.splitEl;
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      el.setPointerCapture(e.pointerId);
+      el.dataset.drag = '1';
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!el.dataset.drag) return;
+      const r = this.canvas.getBoundingClientRect();
+      this.splitPos = clamp((e.clientX - r.left) / r.width, 0, 1);
+      this.positionSplit();
+      this.requestPaint();
+    });
+    const end = () => delete el.dataset.drag;
+    el.addEventListener('pointerup', end);
+    el.addEventListener('pointercancel', end);
+  }
+
+  toggleSplit() {
+    this.split = !this.split;
+    this.root.classList.toggle('splitting', this.split);
+    if (!this.split) {
+      this.origRenderer?.dispose();
+      this.origRenderer = null;
+      this.origCanvas = null;
+      this.origKey = '';
+    } else toast('가운데 손잡이를 좌우로 끌어 원본과 비교해 보세요', { duration: 2500 });
+    this.positionSplit();
+    this.requestPaint();
+  }
+
+  positionSplit() {
+    const show = this.split && this.tab !== 'crop' && !!this.view;
+    this.splitEl.hidden = !show;
+    if (!show) return;
+    const c = this.canvas;
+    const left = parseFloat(c.style.left) || 0;
+    const top = parseFloat(c.style.top) || 0;
+    const w = parseFloat(c.style.width) || c.width;
+    const h = parseFloat(c.style.height) || c.height;
+    const sw = this.stage.clientWidth;
+    const sh = this.stage.clientHeight;
+    // 보이는 부분만큼만 (확대했을 때도 손잡이가 화면 안에)
+    const vTop = Math.max(0, top);
+    const vBot = Math.min(sh, top + h);
+    Object.assign(this.splitEl.style, {
+      left: `${clamp(left + w * this.splitPos, 0, sw)}px`,
+      top: `${vTop}px`,
+      height: `${Math.max(0, vBot - vTop)}px`,
+    });
+  }
+
+  /** 반반 비교용: 같은 자르기·회전으로 원본(편집 전)을 그림 */
+  originalLayer(region, outW, outH, outScale) {
+    const key = JSON.stringify([this.st.geo, region, outW, outH]);
+    if (this.origCanvas && this.origKey === key) return this.origCanvas;
+    if (!this.origRenderer) {
+      this.origRenderer = createRenderer();
+      this.origRenderer.setSource(this.pristine, this.Ww, this.Hw);
+    }
+    const st = dv.defaultState();
+    st.geo = JSON.parse(JSON.stringify(this.st.geo));
+    const { canvas } = this.origRenderer.render(st, { region, outW, outH, outScale });
+    const copy = im.makeCanvas(canvas.width, canvas.height);
+    copy.getContext('2d').drawImage(canvas, 0, 0);
+    this.origCanvas = copy;
+    this.origKey = key;
+    return copy;
   }
 
   /* ---------- 자르기 ---------- */
@@ -1558,6 +1905,16 @@ export class Editor {
   }
 
   startOp(e) {
+    if (this.tab === 'local' && this.lc.tool === 'remove') {
+      // 사물 지우기: 칠하는 동안은 빨간 표시만, 손을 떼면 채움
+      const p = this.toSource(e);
+      this.cur = { tool: 'marker', color: '#ff3b30', size: this.brushRadius() * 2, pts: [...p] };
+      this.fillPts = [...this.renderer.warpPoint(...p)];
+      this.op = { t: 'remove' };
+      this.moveRing(e);
+      this.requestPaint();
+      return;
+    }
     const { cfg, list, hold } = this.brushMode();
     const [x, y] = this.opPoint(e);
     this.op = { t: cfg.tool, r: Math.round(this.brushRadius() * 1e5) / 1e5, s: cfg.strength / 100, p: [x, y] };
@@ -1578,6 +1935,16 @@ export class Editor {
 
   moveOp(e) {
     const op = this.op;
+    if (op.t === 'remove') {
+      const [x, y] = this.toSource(e);
+      const p = this.cur.pts;
+      if (Math.abs(x - p[p.length - 2]) + Math.abs(y - p[p.length - 1]) < 0.002) return;
+      p.push(Math.round(x * 1e5) / 1e5, Math.round(y * 1e5) / 1e5);
+      const [sx, sy] = this.renderer.warpPoint(x, y);
+      this.fillPts.push(Math.round(sx * 1e5) / 1e5, Math.round(sy * 1e5) / 1e5);
+      this.requestPaint();
+      return;
+    }
     const [x, y] = this.opPoint(e);
     const p = op.p;
     const lx = p[p.length - 2];
@@ -1593,6 +1960,10 @@ export class Editor {
     this.opHold = 0;
     const op = this.op;
     this.op = null;
+    if (op.t === 'remove') {
+      this.finishRemove();
+      return;
+    }
     // 밀기를 그냥 톡 누르기만 한 경우는 의미가 없으니 버림
     if (op.t === 'push' && op.p.length < 4) {
       this.opList.pop();
@@ -1603,8 +1974,73 @@ export class Editor {
     this.renderPanel();
   }
 
+  /** 프리셋·복사한 보정 적용 (사진마다 다른 자르기·지우기 등은 그대로) */
+  useStyle(style, msg) {
+    looks.applyStyle(this.st, style);
+    const need = looks.styleNeeds(this.st.adj);
+    if (need.faces) this.ensureFaces();
+    if (need.poses) this.ensurePose();
+    if (need.person) this.ensureSeg();
+    this.faceSel = -1;
+    this.commit();
+    this.renderPanel();
+    this.invalidate();
+    toast(msg);
+  }
+
+  async savePresetFlow() {
+    const name = await promptDialog({ title: '내 보정 저장', placeholder: '예: 따뜻한 카페 · 인생샷 피부', ok: '저장' });
+    if (name === null || name === undefined) return;
+    const item = looks.savePreset(String(name) || '내 보정', this.st);
+    toast(item ? `‘${item.name}’을 저장했어요 · 다른 사진에도 한 번에 적용할 수 있어요` : '저장하지 못했어요 (브라우저 저장 공간을 확인해 주세요)');
+    this.renderPanel();
+  }
+
+  async managePresets() {
+    const list = looks.listPresets();
+    const id = await actionSheet({ title: '지울 보정을 고르세요', items: list.map((p) => ({ label: p.name, icon: 'trash', value: p.id })) });
+    if (!id) return;
+    const p = looks.getPreset(id);
+    if (!p || !(await confirmDialog({ title: `‘${p.name}’을 지울까요?`, ok: '지우기', danger: true }))) return;
+    looks.deletePreset(id);
+    this.renderPanel();
+  }
+
+  /** 사물 지우기: 칠한 곳을 주변 배경으로 채움 (작업용 이미지에 바로 적용, 저장할 때는 원본 해상도로 다시) */
+  finishRemove() {
+    const cur = this.cur;
+    this.cur = null;
+    if (!cur) return;
+    const op = { t: 'fill', r: Math.round((cur.size / 2) * 1e5) / 1e5, p: this.fillPts, seed: this.st.heals.length + 1 };
+    this.fillPts = null;
+    this.setBusy('지우는 중…');
+    setTimeout(() => {
+      try {
+        removeArea(this.work, op, 520);
+        this.st.heals.push(op);
+        this.appliedHeals = JSON.stringify(this.st.heals);
+        this.renderer.setSource(this.work, this.Ww, this.Hw);
+        this.commit();
+      } catch (err) {
+        console.error(err);
+        toast('지우지 못했어요');
+      }
+      this.setBusy('');
+      this.renderPanel();
+      this.invalidate();
+    }, 30);
+  }
+
   /** 두 손가락 확대가 시작되면 그리던 획은 취소 */
   cancelOp() {
+    if (this.op?.t === 'remove') {
+      this.op = null;
+      this.cur = null;
+      this.fillPts = null;
+      this.ringEl.hidden = true;
+      this.requestPaint();
+      return;
+    }
     if (!this.op) return;
     clearInterval(this.opHold);
     this.opHold = 0;
@@ -1633,6 +2069,7 @@ export class Editor {
     });
     if (!choice) return;
     this.setBusy('저장하는 중…');
+    await this.waitDetect();
     await new Promise((r) => setTimeout(r, 30));
     try {
       const src = await decode(this.blob);
@@ -1642,14 +2079,15 @@ export class Editor {
         // 잡티 제거는 원본 해상도에서 같은 위치·비율로 다시 적용
         source = im.makeCanvas(W, H);
         source.getContext('2d', { willReadFrequently: true }).drawImage(src, 0, 0);
-        dv.applyHeals(source, this.st.heals);
+        dv.applyHeals(source, this.st.heals, 900);
       }
       const out = renderFinal(this.renderer, source, W, H, this.st);
       src.close?.();
       this.renderer.setSource(this.work, this.Ww, this.Hw);
       this.baseDirty = true;
       const blob = await im.canvasToBlob(out, this.type);
-      await this.onSave(blob, choice === 'copy');
+      looks.setClip(this.st); // 마지막으로 저장한 보정 → 다른 사진에 붙여넣기 가능
+      await this.onSave(blob, choice === 'copy', JSON.parse(JSON.stringify(this.st)));
     } catch (err) {
       console.error(err);
       toast(`저장하지 못했어요: ${err.message}`);
@@ -1677,6 +2115,7 @@ export class Editor {
     this.destroyed = true;
     cancelAnimationFrame(this.raf);
     clearInterval(this.opHold);
+    this.origRenderer?.dispose();
     clearTimeout(this.histTimer);
     clearTimeout(this.hiResTimer);
     window.removeEventListener('resize', this.onResize);

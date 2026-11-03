@@ -1,6 +1,8 @@
 // 보정 값 모델: 조정 항목, 필터(룩), 톤 커브, 자동 보정, 기하 변환(원근 포함), 잡티 제거
 // 미리보기(축소본)와 저장(원본 해상도)이 같은 결과가 나오도록 모든 좌표·크기를 비율로 다룹니다.
 
+import { removeArea } from './inpaint.js';
+
 /* ---------- 조정 항목 ---------- */
 
 export const ADJ = [
@@ -35,6 +37,16 @@ export const ADJ = [
   { g: 'beauty', bg: 'parts', key: 'nose', label: '코 슬림', min: 0, face: true },
   { g: 'beauty', bg: 'parts', key: 'lips', label: '입술 혈색', min: 0, face: true },
   { g: 'beauty', bg: 'parts', key: 'teeth', label: '치아 미백', min: 0, face: true },
+  { g: 'beauty', bg: 'makeup', key: 'mkLip', label: '립', min: 0, face: true, color: 'lip' },
+  { g: 'beauty', bg: 'makeup', key: 'mkBlush', label: '블러셔', min: 0, face: true, color: 'blush' },
+  { g: 'beauty', bg: 'makeup', key: 'mkShadow', label: '아이섀도', min: 0, face: true, color: 'shadow' },
+  { g: 'beauty', bg: 'makeup', key: 'brow', label: '눈썹 진하게', min: 0, face: true },
+  { g: 'beauty', bg: 'body', key: 'legs', label: '다리 길게', min: 0, pose: true },
+  { g: 'beauty', bg: 'body', key: 'waist', label: '허리 가늘게', min: 0, pose: true },
+  { g: 'beauty', bg: 'body', key: 'shoulder', label: '어깨 넓이', pose: true },
+  { g: 'beauty', bg: 'bg', key: 'bgBlur', label: '배경 흐림', min: 0, seg: true },
+  { g: 'beauty', bg: 'bg', key: 'bgLight', label: '배경 밝기', seg: true },
+  { g: 'beauty', bg: 'bg', key: 'bgMono', label: '배경 흑백', min: 0, seg: true },
 ].map((a) => ({ min: -100, max: 100, ...a }));
 export const ADJ_BY_KEY = Object.fromEntries(ADJ.map((a) => [a.key, a]));
 
@@ -50,7 +62,15 @@ export const HSL_BANDS = [
   ['purple', '보라', '#8b5cf6', 270], ['magenta', '자홍', '#d946ef', 300],
 ];
 
-export const BEAUTY_GROUPS = [['skin', '피부'], ['shape', '얼굴형'], ['parts', '눈·코·입']];
+export const BEAUTY_GROUPS = [['skin', '피부'], ['shape', '얼굴형'], ['parts', '눈·코·입'], ['makeup', '메이크업'], ['body', '몸매'], ['bg', '배경']];
+/** 얼굴마다 따로 정할 수 있는 값 */
+export const FACE_KEYS = ADJ.filter((a) => a.face || ['skinSmooth', 'skinTone'].includes(a.key)).map((a) => a.key);
+
+/** i번 얼굴에 쓸 값 (따로 정한 값이 있으면 그것, 없으면 공통 값) */
+export function faceAdj(adj, st, i) {
+  const own = st.faceAdj?.[i];
+  return own ? { ...adj, ...own } : adj;
+}
 
 export const GRADE_RANGES = [['shadows', '그림자'], ['mids', '중간 톤'], ['highs', '하이라이트']];
 
@@ -71,6 +91,8 @@ export function defaultState() {
     liquify: [], // 손으로 모양 다듬기 획 (retouch.js)
     local: [], // 부분 보정 브러시 획
     erase: [], // 보정 지우개 획 (화면 자리 기준)
+    faceAdj: {}, // 얼굴별 따로 정한 값 { 얼굴 번호: { 키: 값 } }
+    makeup: { lip: 'mlbb', blush: 'peach', shadow: 'brown' },
   };
 }
 
@@ -85,6 +107,7 @@ export function isEdited(st) {
   return Object.values(st.adj).some((v) => v) || curveChanged(st.curve) || hslChanged(st.hsl) || !!gradingChanged(st.grading)
     || (st.look !== 'none' && st.lookAmt > 0) || st.heals.length > 0 || st.strokes.length > 0
     || st.liquify?.length > 0 || st.local?.length > 0
+    || Object.values(st.faceAdj || {}).some((o) => Object.values(o).some((v) => v))
     || g.q || g.flipH || g.flipV || g.angle || g.pv || g.ph
     || c.x > 1e-4 || c.y > 1e-4 || c.w < 0.9999 || c.h < 0.9999;
 }
@@ -542,11 +565,18 @@ export function applyHeal(ctx, W, H, cx, cy, r, dx, dy) {
 }
 
 /** 저장해 둔 잡티 제거(비율 좌표)를 원하는 해상도의 캔버스에 다시 적용 */
-export function applyHeals(canvas, heals) {
+/**
+ * 잡티 제거 · 사물 지우기를 순서대로 다시 적용합니다.
+ * @param fillLimit 사물 지우기 계산 영역의 긴 변 (저장할 때는 크게)
+ */
+export function applyHeals(canvas, heals, fillLimit = 520) {
   if (!heals.length) return;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const W = canvas.width;
   const H = canvas.height;
   const u = Math.max(W, H);
-  for (const h of heals) applyHeal(ctx, W, H, h.x * W, h.y * H, h.r * u, Math.round(h.dx * W), Math.round(h.dy * H));
+  for (const h of heals) {
+    if (h.t === 'fill') removeArea(canvas, h, fillLimit);
+    else applyHeal(ctx, W, H, h.x * W, h.y * H, h.r * u, Math.round(h.dx * W), Math.round(h.dy * H));
+  }
 }

@@ -1,6 +1,8 @@
 // 여러 장 자동 보정: 보정 전/후 미리보기와 한꺼번에 적용
 import * as im from './imaging.js';
-import { previewEnhance, autoEnhanceBlob } from './glrender.js';
+import { previewEnhance, autoEnhanceBlob, styleBlob } from './glrender.js';
+import * as looks from './looks.js';
+import * as dv from './develop.js';
 import * as lib from './library.js';
 import { icon, esc, openModal, fmtNum, progress } from './ui.js';
 
@@ -129,6 +131,39 @@ export async function runBatchEnhance(ids, { strength = 1, asCopy = false } = {}
       result.done++;
     } catch (err) {
       console.error('자동 보정 실패', m.name, err);
+      result.failed++;
+    }
+  }
+  progress.update(ids.length, ids.length);
+  progress.hide();
+  return result;
+}
+
+/**
+ * 저장해 둔 보정(프리셋 · 복사한 보정)을 여러 장에 한꺼번에 적용
+ * 얼굴·몸·배경 보정이 들어 있으면 사진마다 인식해서 적용합니다.
+ */
+export async function runBatchStyle(ids, style, { asCopy = false, title = '보정 적용하는 중' } = {}) {
+  const result = { done: 0, failed: 0, stopped: false };
+  let stop = false;
+  const st = looks.applyStyle(dv.defaultState(), style);
+  const need = looks.styleNeeds(st.adj);
+  progress.show(title, () => { stop = true; });
+  for (let i = 0; i < ids.length; i++) {
+    if (stop) {
+      result.stopped = true;
+      break;
+    }
+    const m = lib.store.byId.get(ids[i]);
+    progress.update(i, ids.length, m?.name || '');
+    if (!m || m.kind !== 'image') continue;
+    try {
+      const blob = await lib.getOriginal(m.id);
+      const out = await styleBlob(blob, m.type, st, need);
+      await lib.saveEdit(m.id, out, { asCopy });
+      result.done++;
+    } catch (err) {
+      console.error('보정 적용 실패', m.name, err);
       result.failed++;
     }
   }
