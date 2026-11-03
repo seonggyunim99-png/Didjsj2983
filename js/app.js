@@ -16,7 +16,7 @@ import { reviewEnhance, runBatchEnhance, STRENGTHS } from './enhance.js';
 import { openCollage } from './collage.js';
 import { canvasToBlob } from './imaging.js';
 
-const APP_VERSION = '3.0';
+const APP_VERSION = '3.0.1';
 
 const $ = (s, root = document) => root.querySelector(s);
 const appbar = $('#appbar');
@@ -2349,6 +2349,9 @@ function showFatal(message) {
 }
 
 async function start() {
+  // 여기까지 왔으면 모든 앱 파일을 제대로 불러온 것 (index.html의 시작 안전장치 해제)
+  window.__pvReady = true;
+  document.getElementById('boot-error')?.remove();
   buildTabbar();
   render();
   if (location.search) history.replaceState(null, '', location.pathname + location.hash);
@@ -2388,4 +2391,7 @@ async function start() {
   }
 }
 
-start();
+start().catch((err) => {
+  console.error(err);
+  showFatal(`앱을 시작하지 못했어요: ${err?.message || err}. 새로고침해 주세요.`);
+});

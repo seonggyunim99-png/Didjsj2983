@@ -1812,3 +1812,32 @@ body.locked .scroller { visibility: hidden; }
 @media (max-width: 600px) {
   .tabbar .tab .ic { width: 52px; padding: 4px 14px; }
 }
+
+/* 앱을 불러오지 못했을 때 안내 (index.html의 시작 안전장치) */
+#boot-error {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg, #fff);
+  color: var(--text, #15171a);
+  text-align: center;
+}
+#boot-error > div { max-width: 360px; }
+#boot-error h2 { margin: 0 0 8px; font-size: 20px; }
+#boot-error p { margin: 0 0 20px; color: var(--text-2, #5b616e); font-size: 14.5px; line-height: 1.6; }
+#boot-error button {
+  min-height: 48px;
+  padding: 0 24px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--accent, #2563eb);
+  color: #fff;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+#boot-error small { display: block; margin-top: 18px; color: var(--text-3, #8a909c); font-size: 12px; word-break: break-all; }

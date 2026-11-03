@@ -1,5 +1,5 @@
 // 서비스 워커: 오프라인 실행 + 다른 앱에서 '공유'로 보낸 사진 받기
-const VERSION = 'v3.0.0';
+const VERSION = 'v3.0.1';
 const CACHE = `photo-vault-${VERSION}`;
 const SHELL = [
   './',
@@ -25,7 +25,10 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // 브라우저 캐시에 남은 이전 파일이 아니라 서버의 최신 파일을 저장합니다
+  event.waitUntil(caches.open(CACHE)
+    .then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (event) => {
@@ -88,7 +91,8 @@ self.addEventListener('fetch', (event) => {
   // 앱 파일: 네트워크 우선(항상 최신), 오프라인이면 저장해 둔 사본 사용
   event.respondWith((async () => {
     try {
-      const response = await fetch(request);
+      // 앱 파일은 매번 서버에 최신인지 확인해서(바뀌지 않았으면 304로 금방 끝남) 옛 파일이 섞이지 않게 합니다
+      const response = await fetch(request, request.mode === 'navigate' ? undefined : { cache: 'no-cache' });
       if (response.ok && response.type === 'basic') {
         const copy = response.clone();
         caches.open(CACHE).then((c) => c.put(request, copy)).catch(() => {});
