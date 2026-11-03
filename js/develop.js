@@ -23,8 +23,18 @@ export const ADJ = [
   { g: 'effects', key: 'fade', label: '페이드', min: 0 },
   { g: 'detail', key: 'sharpness', label: '선명하게', min: 0 },
   { g: 'detail', key: 'noise', label: '노이즈 감소', min: 0 },
-  { g: 'beauty', key: 'skinSmooth', label: '피부 보정', min: 0 },
-  { g: 'beauty', key: 'skinTone', label: '피부톤 밝게', min: 0 },
+  // 인물(뷰티): bg = 화면 묶음, face = 얼굴 인식이 있어야 쓸 수 있음
+  { g: 'beauty', bg: 'skin', key: 'skinSmooth', label: '피부 보정', min: 0 },
+  { g: 'beauty', bg: 'skin', key: 'skinTone', label: '화사하게', min: 0 },
+  { g: 'beauty', bg: 'skin', key: 'darkCircle', label: '다크서클', min: 0, face: true },
+  { g: 'beauty', bg: 'skin', key: 'blush', label: '볼 혈색', min: 0, face: true },
+  { g: 'beauty', bg: 'shape', key: 'faceSlim', label: '얼굴 갸름하게', min: 0, face: true },
+  { g: 'beauty', bg: 'shape', key: 'chin', label: '턱 길이', face: true },
+  { g: 'beauty', bg: 'parts', key: 'eyes', label: '눈 크게', min: 0, face: true },
+  { g: 'beauty', bg: 'parts', key: 'eyeBright', label: '눈 또렷하게', min: 0, face: true },
+  { g: 'beauty', bg: 'parts', key: 'nose', label: '코 슬림', min: 0, face: true },
+  { g: 'beauty', bg: 'parts', key: 'lips', label: '입술 혈색', min: 0, face: true },
+  { g: 'beauty', bg: 'parts', key: 'teeth', label: '치아 미백', min: 0, face: true },
 ].map((a) => ({ min: -100, max: 100, ...a }));
 export const ADJ_BY_KEY = Object.fromEntries(ADJ.map((a) => [a.key, a]));
 
@@ -39,6 +49,8 @@ export const HSL_BANDS = [
   ['green', '초록', '#22c55e', 120], ['aqua', '하늘', '#06b6d4', 180], ['blue', '파랑', '#3b82f6', 240],
   ['purple', '보라', '#8b5cf6', 270], ['magenta', '자홍', '#d946ef', 300],
 ];
+
+export const BEAUTY_GROUPS = [['skin', '피부'], ['shape', '얼굴형'], ['parts', '눈·코·입']];
 
 export const GRADE_RANGES = [['shadows', '그림자'], ['mids', '중간 톤'], ['highs', '하이라이트']];
 

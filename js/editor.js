@@ -4,6 +4,7 @@ import { icon, esc, toast, confirmDialog, actionSheet, isModalOpen } from './ui.
 import * as dv from './develop.js';
 import * as im from './imaging.js';
 import { createRenderer, measure, renderFinal, drawStrokes } from './glrender.js';
+import { detectFaces, AUTO_BEAUTY } from './face.js';
 
 const TABS = [
   ['enhance', 'auto', '보정'],
@@ -111,6 +112,9 @@ export class Editor {
     this.sizes = { pen: 6, marker: 18, mosaic: 26 };
     this.healMode = false;
     this.healSize = 12;
+    this.bgroup = 'skin';
+    this.faces = undefined; // undefined 아직 · null 찾는 중 실패 · [] 없음 · [...] 찾음
+    this.faceState = 'idle';
     this.zoom = 1;
     this.pan = { x: 0, y: 0 };
     this.baseDirty = true;
@@ -371,6 +375,7 @@ export class Editor {
         console.warn(err);
         this.renderer = createRenderer();
         this.renderer.setSource(this.work, this.Ww, this.Hw);
+        this.renderer.setFaces(this.faces);
         const res = this.renderer.render(this.st, { region, outW: c.width, outH: c.height, outScale: pxScale });
         this.glCanvas = res.canvas;
         this.matrix = res.matrix;
@@ -502,6 +507,42 @@ export class Editor {
     return this.sliderRow({ attrs: `data-adj="${a.key}"`, label: a.label, value: v, min: a.min, max: a.max, text: fmtAdj(a, v), changed: !!v, track });
   }
 
+  /** 지금 값이 자동 뷰티 값 그대로인지 */
+  beautyAuto() {
+    const adj = this.st.adj;
+    const faceOk = !!this.faces?.length;
+    let any = false;
+    for (const a of dv.ADJ) {
+      if (a.g !== 'beauty') continue;
+      const want = a.face && !faceOk ? 0 : AUTO_BEAUTY[a.key] || 0;
+      if (adj[a.key] !== want) return false;
+      if (want) any = true;
+    }
+    return any;
+  }
+
+  /** 인물 탭을 처음 열 때 한 번 얼굴을 찾습니다 (기기 안에서만 처리) */
+  async ensureFaces() {
+    if (this.faceState !== 'idle' || !this.work || !this.renderer?.gpu) {
+      if (this.renderer && !this.renderer.gpu && this.faceState === 'idle') this.faceState = 'error';
+      return;
+    }
+    this.faceState = 'busy';
+    try {
+      const faces = await detectFaces(this.work);
+      if (this.destroyed) return;
+      this.faces = faces;
+      this.faceState = 'done';
+      this.renderer.setFaces(faces);
+      this.invalidate();
+    } catch (err) {
+      console.warn('얼굴 인식 실패', err);
+      this.faces = [];
+      this.faceState = 'error';
+    }
+    if (!this.destroyed && this.tab === 'beauty') this.renderPanel();
+  }
+
   groupChanged(g) {
     const st = this.st;
     if (g === 'curve') return dv.curveChanged(st.curve);
@@ -556,14 +597,31 @@ export class Editor {
         </div>
         <div class="ed-group-body">${this.groupBody()}</div>`;
     } else if (this.tab === 'beauty') {
+      const fs = this.faceState;
+      const n = this.faces?.length || 0;
+      const status = fs === 'busy' ? '얼굴을 찾는 중…'
+        : fs === 'error' ? '얼굴 인식을 불러오지 못했어요 · 피부 보정만 쓸 수 있어요'
+          : fs === 'done' && !n ? '얼굴을 찾지 못했어요 · 피부 보정만 쓸 수 있어요'
+            : fs === 'done' ? `얼굴 ${n}명을 찾았어요` : '';
+      const rows = dv.ADJ.filter((a) => a.g === 'beauty' && a.bg === this.bgroup);
+      const autoOn = this.beautyAuto();
       html = `
-        ${dv.ADJ.filter((a) => a.g === 'beauty').map((a) => this.adjRow(a)).join('')}
-        <div class="ed-chips">
-          <button type="button" class="ed-chip${this.healMode ? ' on' : ''}" data-act="heal-toggle">${icon('healing')}잡티 제거 브러시</button>
-          <button type="button" class="ed-chip" data-act="undo-heal"${st.heals.length ? '' : ' disabled'}>${icon('undo')}잡티 하나 되돌리기</button>
+        <div class="ed-chips ed-groups">
+          ${dv.BEAUTY_GROUPS.map(([k, label]) => `<button type="button" class="ed-chip${k === this.bgroup ? ' on' : ''}${dv.ADJ.some((a) => a.bg === k && st.adj[a.key]) ? ' changed' : ''}" data-bgroup="${k}">${label}</button>`).join('')}
+          <button type="button" class="ed-chip ed-auto${autoOn ? ' on' : ''}" data-act="auto-beauty"${fs === 'busy' ? ' disabled' : ''}>${icon('face')}자동 뷰티</button>
+          <button type="button" class="ed-chip" data-act="reset-beauty">${icon('restore')}초기화</button>
         </div>
-        ${this.healMode ? this.sliderRow({ attrs: 'data-slider="healSize"', label: '브러시 크기', value: this.healSize, min: 4, max: 40, text: `${this.healSize}`, reset: false }) : ''}
-        <p class="ed-hint">${this.healMode ? '사진을 확대한 뒤 잡티·여드름·점을 톡 누르거나 문지르세요. 주변 피부로 자연스럽게 메워요.' : '피부 보정은 얼굴과 피부색 부분에만 적용돼요. 잡티 제거 브러시로 점·뾰루지를 지울 수 있어요.'}</p>`;
+        <p class="ed-face-status${fs === 'busy' ? ' busy' : ''}" aria-live="polite">${esc(status)}</p>
+        <div class="ed-group-body">
+          ${rows.map((a) => (a.face && !n ? this.adjRow(a).replace('<input', '<input disabled').replace('ed-slider-row', 'ed-slider-row disabled') : this.adjRow(a))).join('')}
+          ${this.bgroup === 'skin' ? `
+          <div class="ed-chips">
+            <button type="button" class="ed-chip${this.healMode ? ' on' : ''}" data-act="heal-toggle">${icon('healing')}잡티 제거 브러시</button>
+            <button type="button" class="ed-chip" data-act="undo-heal"${st.heals.length ? '' : ' disabled'}>${icon('undo')}잡티 하나 되돌리기</button>
+          </div>
+          ${this.healMode ? this.sliderRow({ attrs: 'data-slider="healSize"', label: '브러시 크기', value: this.healSize, min: 4, max: 40, text: `${this.healSize}`, reset: false }) : ''}` : ''}
+        </div>
+        <p class="ed-hint">${this.healMode ? '사진을 확대한 뒤 잡티·여드름·점을 톡 누르거나 문지르세요. 주변 피부로 자연스럽게 메워요.' : '얼굴을 찾아 피부·눈·코·입·얼굴형을 자연스럽게 다듬어요. 사진은 기기 밖으로 나가지 않아요.'}</p>`;
     } else if (this.tab === 'draw') {
       html = `
         <div class="ed-chips">
@@ -886,6 +944,7 @@ export class Editor {
       if (this.tab !== tab.dataset.tab) {
         this.tab = tab.dataset.tab;
         if (this.tab !== 'beauty') this.healMode = false;
+        else this.ensureFaces();
         this.renderPanel();
         this.layout();
       }
@@ -928,6 +987,12 @@ export class Editor {
         : this.sliderRow({ attrs: 'data-slider="filterAmt"', label: '강도', value: Math.round(st.lookAmt * 100), min: 0, max: 100, text: `${Math.round(st.lookAmt * 100)}`, reset: false });
       this.panel.querySelectorAll('input[type=range]').forEach((r) => this.paintSlider(r));
       this.invalidate();
+      return;
+    }
+    if ((el = pick('[data-bgroup]'))) {
+      this.bgroup = el.dataset.bgroup;
+      if (this.bgroup !== 'skin') this.healMode = false;
+      this.renderPanel();
       return;
     }
     if ((el = pick('[data-group]'))) {
@@ -1025,6 +1090,25 @@ export class Editor {
       }
       case 'curve-reset':
         st.curve[this.curveCh] = [[0, 0], [1, 1]];
+        this.commit();
+        this.renderPanel();
+        this.invalidate();
+        break;
+      case 'auto-beauty': {
+        const on = this.beautyAuto();
+        const faceOk = !!this.faces?.length;
+        for (const a of dv.ADJ) {
+          if (a.g !== 'beauty') continue;
+          st.adj[a.key] = on ? 0 : (a.face && !faceOk ? 0 : AUTO_BEAUTY[a.key] || 0);
+        }
+        this.commit();
+        this.renderPanel();
+        this.invalidate();
+        if (!on) toast(faceOk ? '자연스럽게 다듬었어요 · 슬라이더로 정도를 바꿀 수 있어요' : '얼굴을 찾지 못해 피부만 보정했어요');
+        break;
+      }
+      case 'reset-beauty':
+        for (const a of dv.ADJ) if (a.g === 'beauty') st.adj[a.key] = 0;
         this.commit();
         this.renderPanel();
         this.invalidate();

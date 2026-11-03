@@ -1952,3 +1952,12 @@ body.locked .scroller { visibility: hidden; }
   .editor .ed-tab .ic { width: 22px; height: 22px; }
   .editor .ed-tab span { font-size: 11px; }
 }
+
+/* 3.2 인물(뷰티) */
+.ed-face-status { margin: 2px 18px 6px; font-size: 12.5px; color: #9aa4b2; min-height: 16px; }
+.ed-face-status.busy::before {
+  content: ''; display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px;
+  border: 2px solid #8fb3ff; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite;
+}
+.ed-slider-row.disabled { opacity: .38; }
+.ed-slider-row.disabled input { pointer-events: none; }

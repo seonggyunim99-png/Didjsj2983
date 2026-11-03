@@ -2,6 +2,7 @@
 // WebGL2를 쓸 수 없는 오래된 기기에서는 기존(CPU) 방식으로 기본 보정만 적용합니다.
 import * as dv from './develop.js';
 import * as im from './imaging.js';
+import { buildWarps, buildMasks } from './face.js';
 
 /* ---------- 셰이더 ---------- */
 
@@ -21,10 +22,34 @@ uniform sampler2D uSrc;
 uniform mat3 uInv;
 uniform vec2 uSrcSize;
 uniform vec2 uOut;
+// 얼굴형 다듬기: a = (x, y, 반지름, 종류 0 확대·1 밀기), b = (밀기 x, y, 확대 세기) — 긴 변 기준 단위
+uniform int uOpN;
+uniform vec4 uOpA[40];
+uniform vec4 uOpB[40];
+vec2 warp(vec2 q) {
+  vec2 p = q;
+  for (int i = 0; i < 40; i++) {
+    if (i >= uOpN) break;
+    vec4 a = uOpA[i];
+    vec2 d = q - a.xy;
+    float dist = length(d);
+    if (dist >= a.z) continue;
+    float t = dist / a.z;
+    float w = 1.0 - t * t;
+    if (a.w < 0.5) p -= d * (uOpB[i].z * w);
+    else p -= uOpB[i].xy * (w * w);
+  }
+  return p;
+}
 void main() {
   vec2 p = vec2(gl_FragCoord.x, uOut.y - gl_FragCoord.y);
   vec3 s = uInv * vec3(p, 1.0);
-  vec2 uv = (s.xy / s.z) / uSrcSize;
+  vec2 sp = s.xy / s.z;
+  if (uOpN > 0) {
+    float M = max(uSrcSize.x, uSrcSize.y);
+    sp = warp(sp / M) * M;
+  }
+  vec2 uv = sp / uSrcSize;
   vec4 c = texture(uSrc, uv);
   if (uv.x < -0.002 || uv.y < -0.002 || uv.x > 1.002 || uv.y > 1.002) c = vec4(0.0);
   o = c;
@@ -115,6 +140,8 @@ uniform sampler2D uBM;
 uniform sampler2D uSB;
 uniform sampler2D uSG;
 uniform sampler2D uNC;
+uniform sampler2D uMK1;
+uniform sampler2D uMK2;
 uniform sampler2D uLut;
 uniform vec2 uOut;
 uniform vec3 uWB;
@@ -123,7 +150,8 @@ uniform float uClarity, uTexture, uDehaze, uVib, uSat, uFade, uVig, uGrain, uSha
 uniform vec3 uHsl[8];
 uniform vec3 uGS, uGM, uGH;
 uniform float uBal;
-uniform int uHasHsl, uHasSkin, uHasNC;
+uniform int uHasHsl, uHasSkin, uHasNC, uHasFace;
+uniform float uDark, uBlush, uLips, uTeeth, uEyeB;
 
 vec3 toLin(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
 vec3 toGam(vec3 c) { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }
@@ -193,14 +221,37 @@ void main() {
     dSmall *= 1.0 - uNoise * 0.8;
   }
 
+  // 얼굴 부위 영역 (얼굴 인식이 있을 때)
+  vec4 k1 = vec4(0.0);
+  vec4 k2 = vec4(0.0);
+  if (uHasFace == 1) {
+    k1 = texture(uMK1, uv);
+    k2 = texture(uMK2, uv);
+  }
+
   // 피부: 결(잔디테일)은 조금 남기고 잡티와 얼룩만 부드럽게
   if (uHasSkin == 1) {
     vec3 sb = texture(uSB, uv).rgb;
     vec3 sg = texture(uSG, uv).rgb;
     float m = skinMask(sb);
+    if (uHasFace == 1) m = k1.r * (0.35 + 0.65 * m); // 얼굴 피부 영역 위주
     c = mix(c, sb + (c - sg) * 0.3, m * uSkin);
     c = mix(c, c + (vec3(1.0) - c) * vec3(0.16, 0.13, 0.12) * uSkinTone, m);
     dSmall *= 1.0 - m * uSkin * 0.7;
+  }
+
+  // 뷰티: 다크서클 · 볼 혈색 · 입술 · 치아 · 눈
+  if (uHasFace == 1) {
+    vec3 lifted = c + (1.0 - c) * vec3(0.17, 0.15, 0.14);
+    lifted = mix(vec3(luma(lifted)), lifted, 0.85);
+    c = mix(c, lifted, k1.a * uDark * 0.9);
+    c = mix(c, c * vec3(1.04, 0.91, 0.93) + vec3(0.015, 0.0, 0.008), k2.r * uBlush * 0.65);
+    vec3 lip = c * vec3(1.1, 0.8, 0.88);
+    lip = luma(lip) + (lip - luma(lip)) * 1.3;
+    c = mix(c, lip, k1.g * uLips * 0.7);
+    float tm = k1.b * uTeeth * smoothstep(0.28, 0.5, luma(c));
+    c = mix(c, vec3(luma(c)) * 1.06 + vec3(0.0, 0.003, 0.012), tm * 0.75);
+    c += k2.g * uEyeB * (dSmall * 1.8 + 0.035);
   }
 
   // 화이트밸런스 · 노출 (빛의 세기 그대로인 선형 공간에서)
@@ -489,12 +540,31 @@ export class GLRenderer {
     const M = dv.geoMatrix3(this.W, this.H, st.geo, region, outScale);
     const inv = dv.inv3(M);
 
-    // 1) 기하 변환
-    const A = this.target('A', outW, outH, false, true);
-    this.pass(this.prog.geo, A, outW, outH, { uSrc: this.srcTex }, (p) => {
+    // 1) 기하 변환 (+ 얼굴형 다듬기)
+    const faces = this.faces?.length ? this.faces : null;
+    const warps = faces ? buildWarps(faces, a, this.W, this.H) : { n: 0 };
+    const geoSet = (p) => {
       gl.uniformMatrix3fv(p.u('uInv'), false, transpose3(inv));
       gl.uniform2f(p.u('uSrcSize'), this.W, this.H);
-    });
+      gl.uniform1i(p.u('uOpN'), warps.n);
+      if (warps.n) {
+        gl.uniform4fv(p.u('uOpA[0]'), warps.a);
+        gl.uniform4fv(p.u('uOpB[0]'), warps.b);
+      }
+    };
+    const A = this.target('A', outW, outH, false, true);
+    this.pass(this.prog.geo, A, outW, outH, { uSrc: this.srcTex }, geoSet);
+    // 얼굴 부위 영역도 같은 변형으로
+    const beauty = ['skinSmooth', 'skinTone', 'darkCircle', 'blush', 'lips', 'teeth', 'eyeBright'].some((k) => a[k] > 0);
+    let MK1 = null;
+    let MK2 = null;
+    if (faces && beauty) {
+      this.ensureMasks();
+      MK1 = this.target('MK1', outW, outH, false);
+      this.pass(this.prog.geo, MK1, outW, outH, { uSrc: this.mk1Tex }, geoSet);
+      MK2 = this.target('MK2', outW, outH, false);
+      this.pass(this.prog.geo, MK2, outW, outH, { uSrc: this.mk2Tex }, geoSet);
+    }
     gl.bindTexture(gl.TEXTURE_2D, A.tex);
     gl.generateMipmap(gl.TEXTURE_2D);
 
@@ -550,7 +620,7 @@ export class GLRenderer {
     const hasHsl = P.hsl.some((v) => v.some((x) => x));
     const wb = dv.wbGains(a.temp, a.tint);
     this.pass(this.prog.develop, null, outW, outH, {
-      uImg: A.tex, uBL: BL.tex, uBM: BM.tex, uSB: SB ? SB.tex : this.dummy, uSG: SG ? SG.tex : this.dummy, uNC: NC ? NC.tex : this.dummy, uLut: this.lutTex,
+      uImg: A.tex, uBL: BL.tex, uBM: BM.tex, uSB: SB ? SB.tex : this.dummy, uSG: SG ? SG.tex : this.dummy, uNC: NC ? NC.tex : this.dummy, uMK1: MK1 ? MK1.tex : this.dummy, uMK2: MK2 ? MK2.tex : this.dummy, uLut: this.lutTex,
     }, (p) => {
       const f = (n, v) => gl.uniform1f(p.u(n), v);
       gl.uniform3f(p.u('uWB'), ...wb);
@@ -582,8 +652,37 @@ export class GLRenderer {
       gl.uniform1i(p.u('uHasHsl'), hasHsl ? 1 : 0);
       gl.uniform1i(p.u('uHasSkin'), skin ? 1 : 0);
       gl.uniform1i(p.u('uHasNC'), NC ? 1 : 0);
+      gl.uniform1i(p.u('uHasFace'), MK1 ? 1 : 0);
+      f('uDark', a.darkCircle / 100);
+      f('uBlush', a.blush / 100);
+      f('uLips', a.lips / 100);
+      f('uTeeth', a.teeth / 100);
+      f('uEyeB', a.eyeBright / 100);
     });
     return { canvas: this.canvas, matrix: M };
+  }
+
+  /** 얼굴 인식 결과(비율 좌표)를 알려 줍니다. null이면 얼굴 없음 */
+  setFaces(faces) {
+    this.faces = faces && faces.length ? faces : null;
+    this.maskKey = null;
+  }
+
+  ensureMasks() {
+    const k = 1024 / Math.max(this.W, this.H);
+    const w = Math.max(2, Math.round(this.W * k));
+    const h = Math.max(2, Math.round(this.H * k));
+    const key = `${w}x${h}`;
+    if (this.maskKey === key) return;
+    const { m1, m2 } = buildMasks(this.faces, w, h);
+    const gl = this.gl;
+    for (const [name, data] of [['mk1Tex', m1], ['mk2Tex', m2]]) {
+      if (!this[name]) this[name] = this.texture(w, h, false);
+      gl.bindTexture(gl.TEXTURE_2D, this[name]);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    }
+    this.maskKey = key;
   }
 
   dispose() {
@@ -637,6 +736,8 @@ class CPURenderer {
   }
 
   trim() {}
+
+  setFaces() {}
 
   dispose() {}
 }
